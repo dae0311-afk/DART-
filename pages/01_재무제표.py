@@ -1,22 +1,19 @@
 """
-pages/01_재무제표.py  ─  요약재무제표 (매출액·영업이익)
+pages/01_재무제표.py  ─  요약재무제표 (단일 파일 버전)
 """
 from __future__ import annotations
 
 import datetime
-import pathlib
-import sys
-
-# core 모듈 경로 추가
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+import io
+import re
+import zipfile
+import xml.etree.ElementTree as ET
+from typing import Optional
 
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-
-import core.dart_api as dart_api
-import core.financial as financial
 
 st.set_page_config(page_title="요약재무제표", page_icon="📊", layout="wide")
 
@@ -26,7 +23,116 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 API_KEY     = st.secrets["DART_API_KEY"]
-LATEST_YEAR = datetime.date.today().year - 1   # 가장 최근 사업보고서
+DART_BASE   = "https://opendart.fss.or.kr/api"
+LATEST_YEAR = datetime.date.today().year - 1
+
+# ── 단위 환산 ──────────────────────────────────────────────────────────────
+UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
+
+ACCOUNT_KEYWORDS = {
+    "매출액":  ["매출액", "영업수익", "수익(매출액)"],
+    "영업이익": ["영업이익", "영업손익"],
+}
+
+# ── DART API 함수 ──────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=86_400, show_spinner=False)
+def get_corp_list(api_key: str) -> pd.DataFrame:
+    resp = requests.get(
+        f"{DART_BASE}/corpCode.xml",
+        params={"crtfc_key": api_key},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+        xml_bytes = zf.read("CORPCODE.xml")
+    root = ET.fromstring(xml_bytes)
+    rows = [
+        {
+            "corp_code":  item.findtext("corp_code", ""),
+            "corp_name":  item.findtext("corp_name", ""),
+            "stock_code": (item.findtext("stock_code") or "").strip(),
+        }
+        for item in root.findall("list")
+    ]
+    return pd.DataFrame(rows)
+
+
+def search_corp(api_key: str, query: str) -> pd.DataFrame:
+    df = get_corp_list(api_key)
+    mask = df["corp_name"].str.contains(query.strip(), na=False, regex=False)
+    result = df[mask].copy()
+    result["_listed"] = result["stock_code"].str.strip().ne("")
+    result = result.sort_values("_listed", ascending=False).drop(columns="_listed")
+    return result.reset_index(drop=True)
+
+
+@st.cache_data(ttl=3_600, show_spinner=False)
+def fetch_annual(api_key: str, corp_code: str, year: int, fs_div: str) -> tuple[list, str]:
+    def _call(fsdiv: str) -> dict:
+        return requests.get(
+            f"{DART_BASE}/fnlttSinglAcnt.json",
+            params={
+                "crtfc_key":  api_key,
+                "corp_code":  corp_code,
+                "bsns_year":  str(year),
+                "reprt_code": "11011",
+                "fs_div":     fsdiv,
+            },
+            timeout=15,
+        ).json()
+
+    data = _call(fs_div)
+    if data.get("status") == "000":
+        return data.get("list", []), fs_div
+    if fs_div == "CFS" and data.get("status") in ("013", "020"):
+        data2 = _call("OFS")
+        if data2.get("status") == "000":
+            return data2.get("list", []), "OFS"
+    return [], fs_div
+
+
+# ── 재무 계산 함수 ─────────────────────────────────────────────────────────
+
+def parse_amount(s: str) -> Optional[float]:
+    if not s:
+        return None
+    cleaned = re.sub(r"[,\s]", "", s).strip()
+    if cleaned in ("", "-", "−", "0"):
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def convert(value: float, from_unit: str, to_unit: str) -> float:
+    in_won = value * UNIT_WON.get(from_unit, 1_000)
+    return in_won / UNIT_WON.get(to_unit, 100_000_000)
+
+
+def extract_account(records: list, keywords: list[str]) -> Optional[float]:
+    for r in records:
+        nm = (r.get("account_nm") or "").strip()
+        if any(kw in nm for kw in keywords):
+            raw = r.get("thstrm_amount") or r.get("thstrm_add_amount")
+            return parse_amount(raw)
+    return None
+
+
+def build_df(years, records_map, dart_unit, display_unit) -> pd.DataFrame:
+    rows = []
+    for yr in years:
+        records = records_map.get(yr, [])
+        revenue = extract_account(records, ACCOUNT_KEYWORDS["매출액"])
+        op_inc  = extract_account(records, ACCOUNT_KEYWORDS["영업이익"])
+        rows.append({
+            "연도":    str(yr),
+            "매출액":  convert(revenue, dart_unit, display_unit) if revenue is not None else None,
+            "영업이익": convert(op_inc,  dart_unit, display_unit) if op_inc  is not None else None,
+        })
+    return pd.DataFrame(rows)
+
 
 # ── 사이드바 옵션 ───────────────────────────────────────────────────────────
 with st.sidebar:
@@ -61,11 +167,7 @@ with st.sidebar:
             "DART 원본 단위",
             options=["천원", "백만원", "원"],
             index=0,
-            help=(
-                "DART API 반환 금액의 원본 단위.\n"
-                "대부분 **천원**이나 일부 기업은 백만원 사용.\n"
-                "숫자가 이상하면 여기서 조정하세요."
-            ),
+            help="DART API 반환 금액의 원본 단위. 숫자가 이상하면 여기서 조정하세요.",
             horizontal=True,
         )
 
@@ -85,7 +187,7 @@ with c2:
 
 if search_btn and query.strip():
     with st.spinner("기업 검색 중…"):
-        results = dart_api.search_corp(API_KEY, query.strip())
+        results = search_corp(API_KEY, query.strip())
     if results.empty:
         st.error("검색 결과가 없습니다.")
     else:
@@ -119,13 +221,12 @@ if "search_results" in st.session_state:
 
         prog = st.progress(0, text="DART에서 데이터 불러오는 중…")
         for i, yr in enumerate(years):
-            recs, used_fs       = dart_api.fetch_annual(API_KEY, chosen["corp_code"], yr, fs_div)
-            records_map[yr]     = recs
-            actual_fs[yr]       = used_fs
+            recs, used_fs   = fetch_annual(API_KEY, chosen["corp_code"], yr, fs_div)
+            records_map[yr] = recs
+            actual_fs[yr]   = used_fs
             prog.progress((i + 1) / len(years), text=f"{yr}년 조회 중…")
         prog.empty()
 
-        # fallback 알림
         fallback_yrs = [yr for yr, fs in actual_fs.items() if fs != fs_div and records_map[yr]]
         if fallback_yrs:
             st.info(
@@ -133,7 +234,7 @@ if "search_results" in st.session_state:
                 "별도재무제표로 대체 조회했습니다."
             )
 
-        df = financial.build_df(years, records_map, dart_unit, display_unit)
+        df = build_df(years, records_map, dart_unit, display_unit)
         st.session_state["result_df"]   = df
         st.session_state["result_meta"] = {
             "corp_name":    chosen["corp_name"],
@@ -152,7 +253,6 @@ if "result_df" in st.session_state:
 
     st.subheader(f"{corp_name}  |  {fs_label}  |  단위: {u}")
 
-    # ── 테이블 ─────────────────────────────────────────────────────────────
     fmt = df.copy()
     for col in ["매출액", "영업이익"]:
         fmt[col] = fmt[col].apply(
@@ -170,7 +270,6 @@ if "result_df" in st.session_state:
 
     st.dataframe(fmt, use_container_width=True, hide_index=True)
 
-    # ── 차트 ───────────────────────────────────────────────────────────────
     valid_r = df.dropna(subset=["매출액"])
     valid_o = df.dropna(subset=["영업이익"])
 
@@ -202,12 +301,7 @@ if "result_df" in st.session_state:
         barmode="group",
         plot_bgcolor="white",
         paper_bgcolor="white",
-        yaxis=dict(
-            title=u,
-            gridcolor="#EBEBEB",
-            zeroline=True,
-            zerolinecolor="#CCCCCC",
-        ),
+        yaxis=dict(title=u, gridcolor="#EBEBEB", zeroline=True, zerolinecolor="#CCCCCC"),
         xaxis=dict(title="", type="category"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(t=60, b=30, l=70, r=20),
@@ -216,8 +310,6 @@ if "result_df" in st.session_state:
 
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── 데이터 없는 연도 경고 ───────────────────────────────────────────────
     missing = df[df["매출액"].isna()]["연도"].tolist()
     if missing:
         st.warning(f"⚠️ 다음 연도는 데이터를 가져오지 못했습니다: {', '.join(missing)}")
-
