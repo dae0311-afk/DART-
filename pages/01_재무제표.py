@@ -58,13 +58,37 @@ def get_corp_list(api_key: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def search_corp(api_key: str, query: str) -> pd.DataFrame:
-    df = get_corp_list(api_key)
-    mask = df["corp_name"].str.contains(query.strip(), na=False, regex=False)
-    result = df[mask].copy()
+def search_corp(api_key: str, query: str) -> tuple[pd.DataFrame, str]:
+    """
+    회사명 / 종목코드(6자리) / DART corp_code(8자리) 통합 검색
+    Returns: (결과 DataFrame, 검색방식 설명 문자열)
+    """
+    df  = get_corp_list(api_key)
+    q   = query.strip()
+
+    # 숫자만으로 이루어진 경우 코드 검색
+    if q.isdigit():
+        if len(q) == 6:
+            # 종목코드 (상장사)
+            result = df[df["stock_code"] == q].copy()
+            mode   = f"종목코드 {q}"
+        elif len(q) == 8:
+            # DART corp_code (전 법인)
+            result = df[df["corp_code"] == q].copy()
+            mode   = f"DART 기업코드 {q}"
+        else:
+            # 그 외 숫자: 회사명 부분검색 fallback
+            result = df[df["corp_name"].str.contains(q, na=False, regex=False)].copy()
+            mode   = f"회사명 '{q}'"
+    else:
+        # 문자 포함 → 회사명 검색
+        result = df[df["corp_name"].str.contains(q, na=False, regex=False)].copy()
+        mode   = f"회사명 '{q}'"
+
+    # 상장사 우선 정렬
     result["_listed"] = result["stock_code"].str.strip().ne("")
     result = result.sort_values("_listed", ascending=False).drop(columns="_listed")
-    return result.reset_index(drop=True)
+    return result.reset_index(drop=True), mode
 
 
 @st.cache_data(ttl=3_600, show_spinner=False)
@@ -174,12 +198,13 @@ with st.sidebar:
 # ── 회사 검색 ──────────────────────────────────────────────────────────────
 st.title("📊 요약재무제표")
 st.caption("사업보고서 기준 | 매출액 · 영업이익 · 영업이익률")
+st.caption("💡 사명이 바뀐 경우: 현재 사명, 종목코드(6자리), 또는 DART 기업코드(8자리)로 검색하세요.")
 
 c1, c2 = st.columns([4, 1])
 with c1:
     query = st.text_input(
-        "회사명 검색",
-        placeholder="예: 삼성전자   카카오   LG에너지솔루션",
+        "검색",
+        placeholder="회사명 · 종목코드(6자리) · DART 기업코드(8자리)",
         label_visibility="collapsed",
     )
 with c2:
@@ -187,10 +212,11 @@ with c2:
 
 if search_btn and query.strip():
     with st.spinner("기업 검색 중…"):
-        results = search_corp(API_KEY, query.strip())
+        results, search_mode = search_corp(API_KEY, query.strip())
     if results.empty:
-        st.error("검색 결과가 없습니다.")
+        st.error(f"'{query}' 검색 결과가 없습니다.")
     else:
+        st.success(f"**{search_mode}** 기준으로 {len(results)}개 검색됨")
         st.session_state["search_results"] = results
         st.session_state.pop("result_df", None)
 
