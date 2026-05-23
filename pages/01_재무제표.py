@@ -32,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v10"
+PARSER_VER = "v11"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -507,18 +507,35 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
     out["현금성자산"] = sum(cash_bd.values()) if cash_bd else None
     out["총차입금"]   = sum(debt_bd.values()) if debt_bd else None
 
-    # D&A: 현금흐름표(CF) 가산항목 합산
+    # D&A: XBRL 전 섹션에서 탐색 (DART AcntAll은 CF를 sj_div 없이 주거나 누락하기도 함)
     da, da_hit = 0.0, False
+    seen_da = set()
     for it in items:
-        if it.get("sj_div") != "CF":
+        sj = it.get("sj_div") or ""
+        # IS/BS의 자산 계정과 혼동 방지: 현금흐름표 또는 sj_div 미상만
+        if sj in ("BS",):
             continue
         nm = (it.get("account_nm") or "").replace(" ", "")
         if m_dep(nm) or m_amort(nm) or m_rou(nm):
+            key = (nm, it.get("thstrm_amount"))
+            if key in seen_da:
+                continue
+            seen_da.add(key)
             v = parse_amt(it.get("thstrm_amount"))
-            if v is not None:
+            if v is not None and abs(v) > 0:
                 da += abs(v); da_hit = True
+    da_src = "XBRL"
+
+    # XBRL에 D&A 없으면 → 사업보고서/감사보고서 원문에서 보강
+    if not da_hit:
+        rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)
+        if rcept:
+            doc = parse_financials(api_key, rcept, diag)
+            if doc.get("DA") is not None:
+                da = doc["DA"]; da_hit = True; da_src = "원문(CF)"
+
     out["DA"] = da if da_hit else None
-    out["DA_src"] = "현금흐름표(XBRL)" if da_hit else "미발견"
+    out["DA_src"] = da_src if da_hit else "미발견"
 
     if out["영업이익"] is not None and da_hit:
         out["EBITDA"] = out["영업이익"] + da
@@ -528,7 +545,7 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
     out["kind"] = "연결" if used_fs == "CFS" else "별도"
     out["source"] = "정형(XBRL)"
     diag.append(f"{year} · 정형추출 매출:{out['매출액']} 영업:{out['영업이익']} "
-                f"EBITDA:{out['EBITDA']} ({out['kind']})")
+                f"D&A:{out['DA']}({out['DA_src']}) EBITDA:{out['EBITDA']} ({out['kind']})")
     return out
 
 
@@ -695,12 +712,27 @@ if "year_data" in st.session_state:
     disp_years = [y for y in cand if any(year_data[y].get(k) is not None
                                          for k in ("매출액", "자산총계", "영업이익", "당기순이익"))]
 
-    # 헤더 pill
-    req_label = "연결" if meta["want_cfs"] else "별도"
+    # 실제 결과에 포함된 연결/별도 종류 → pill 라벨 결정
+    kinds = [year_data[y].get("kind") for y in disp_years]
+    has_cons = "연결" in kinds
+    has_sep  = "별도" in kinds
+    if has_cons and has_sep:
+        fs_pills = ["연결", "별도"]
+    elif has_cons:
+        fs_pills = ["연결"]
+    elif has_sep:
+        fs_pills = ["별도"]
+    else:
+        fs_pills = ["연결" if meta["want_cfs"] else "별도"]   # 데이터 없을 때 요청값
+
+    fs_pill_html = "".join(
+        f'<span style="background:#2E6DA4;color:#fff;padding:4px 14px;border-radius:16px;'
+        f'font-size:0.95rem;margin-right:6px;">{lbl}</span>' for lbl in fs_pills)
+
     st.markdown(
         f'<div style="margin:2px 0 10px 0;">'
         f'<span style="background:#1E3D6B;color:#fff;padding:4px 14px;border-radius:16px;font-size:0.95rem;margin-right:6px;">{meta["corp_name"]}</span>'
-        f'<span style="background:#2E6DA4;color:#fff;padding:4px 14px;border-radius:16px;font-size:0.95rem;margin-right:6px;">{req_label}</span>'
+        f'{fs_pill_html}'
         f'<span style="background:#E8EEF6;color:#1E3D6B;padding:4px 14px;border-radius:16px;font-size:0.95rem;">{display_unit}</span>'
         f'</div>', unsafe_allow_html=True)
 
@@ -714,10 +746,10 @@ if "year_data" in st.session_state:
     start_year = disp_years[0]
     if start_year > disp_start:
         st.info(f"ℹ️ 데이터는 **{start_year}년부터** 공시되어 이전 기간은 제외했습니다.")
-    if meta["want_cfs"]:
+    if meta["want_cfs"] and has_sep:
         fb = [y for y in disp_years if year_data[y].get("kind") == "별도"]
         if fb:
-            st.info(f"ℹ️ {compress_years(fb)}년은 연결감사보고서가 없어 **별도** 기준으로 표시했습니다.")
+            st.info(f"ℹ️ {compress_years(fb)}년은 연결재무제표가 없어 **별도** 기준으로 표시했습니다.")
 
     # ── 시리즈 헬퍼 ──
     def val(y, key):
@@ -784,18 +816,43 @@ if "year_data" in st.session_state:
     def bar_line(title, bar_key, line_fn, line_name, bar_color="#1E3D6B"):
         bar_vals  = [val(y, bar_key) for y in ys]
         line_vals = [line_fn(y) for y in ys]
+
+        # 막대: 최대값이 축의 2/3 지점에 오도록 y축 상한 = max*1.5
+        bvals = [v for v in bar_vals if v is not None]
+        bar_max = max(bvals) if bvals else 1
+        bar_min = min(bvals + [0]) if bvals else 0
+        y_top = bar_max * 1.5 if bar_max > 0 else 1
+        y_bot = bar_min * 1.2 if bar_min < 0 else 0
+
+        # 라인: 상단 1/3 영역에 놓이도록 우축 범위를 넓게 (겹침 최소화)
+        lvals = [v for v in line_vals if v is not None]
+        if lvals:
+            lmin, lmax = min(lvals), max(lvals)
+            pad = (lmax - lmin) * 0.3 or abs(lmax) * 0.3 or 1
+            # 라인을 위쪽에 배치: 하한을 낮춰 라인이 차트 상단에 뜨게
+            y2_bot = lmin - pad * 4
+            y2_top = lmax + pad
+        else:
+            y2_bot, y2_top = 0, 1
+
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=yr_str, y=bar_vals, name=bar_key if title is None else title.split("·")[0].strip(),
-                             marker_color=bar_color, yaxis="y",
-                             text=[fmt_val(v) for v in bar_vals], textposition="outside", textfont=dict(size=10)))
-        fig.add_trace(go.Scatter(x=yr_str, y=line_vals, name=line_name, yaxis="y2",
-                                 mode="lines+markers", line=dict(color="#E67E22", width=2)))
-        fig.update_layout(title=title, barmode="group", plot_bgcolor="white", paper_bgcolor="white",
-                          yaxis=dict(title=display_unit, gridcolor="#EBEBEB"),
-                          yaxis2=dict(overlaying="y", side="right", showgrid=False, ticksuffix="%"),
-                          xaxis=dict(type="category"),
-                          legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                          margin=dict(t=60, b=30, l=60, r=60), height=360)
+        fig.add_trace(go.Bar(
+            x=yr_str, y=bar_vals,
+            name=title.split("·")[0].strip(),
+            marker_color=bar_color, yaxis="y", width=0.45,
+            text=[fmt_val(v) for v in bar_vals], textposition="outside", textfont=dict(size=10)))
+        fig.add_trace(go.Scatter(
+            x=yr_str, y=line_vals, name=line_name, yaxis="y2",
+            mode="lines+markers+text", line=dict(color="#E67E22", width=2),
+            text=[fmt_pct(v) for v in line_vals], textposition="top center", textfont=dict(size=9, color="#B5651D")))
+        fig.update_layout(
+            title=title, plot_bgcolor="white", paper_bgcolor="white",
+            yaxis=dict(title=display_unit, gridcolor="#EBEBEB", range=[y_bot, y_top]),
+            yaxis2=dict(overlaying="y", side="right", showgrid=False, ticksuffix="%",
+                        range=[y2_bot, y2_top]),
+            xaxis=dict(type="category"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            margin=dict(t=60, b=30, l=60, r=60), height=360, bargap=0.5)
         st.plotly_chart(fig, use_container_width=True)
 
     bar_line(f"매출액 · 성장률", "매출액", growth, "성장률(%)")
@@ -838,23 +895,23 @@ if "year_data" in st.session_state:
         # 표시단위 환산 + 포맷 (pandas 3.x: applymap 제거됨 → map 사용)
         return df.map(lambda v: fmt_val(v / div) if v is not None else "—")
 
-    cc, dc = st.columns(2)
-    with cc:
-        st.markdown("**현금성자산 구성**")
-        cash_has = any(year_data[y].get("cash_bd") for y in ys)
-        if cash_has:
-            st.dataframe(breakdown_df("cash_bd", "현금성자산"), use_container_width=True)
-        else:
-            st.info("현금성자산 세부 항목을 재무상태표에서 찾지 못했습니다.")
-        st.caption("순부채 산정용. 현금및현금성자산 + 단기금융상품/투자자산 등 valuation 관점 포함.")
-    with dc:
-        st.markdown("**총차입금 구성**")
-        debt_has = any(year_data[y].get("debt_bd") for y in ys)
-        if debt_has:
-            st.dataframe(breakdown_df("debt_bd", "총차입금"), use_container_width=True)
-        else:
-            st.info("차입금 항목을 재무상태표에서 찾지 못했습니다. (진단 로그의 BS 항목명을 확인하세요)")
-        st.caption("단기·장기차입금 + 사채 + 유동성장기부채 + 리스부채 포함.")
+    st.divider()
+    st.markdown("**현금성자산 구성**")
+    cash_has = any(year_data[y].get("cash_bd") for y in ys)
+    if cash_has:
+        st.dataframe(breakdown_df("cash_bd", "현금성자산"), use_container_width=True)
+    else:
+        st.info("현금성자산 세부 항목을 재무상태표에서 찾지 못했습니다.")
+    st.caption("순부채 산정용. 현금및현금성자산 + 단기금융상품/투자자산 등 valuation 관점 포함.")
+
+    st.write("")
+    st.markdown("**총차입금 구성**")
+    debt_has = any(year_data[y].get("debt_bd") for y in ys)
+    if debt_has:
+        st.dataframe(breakdown_df("debt_bd", "총차입금"), use_container_width=True)
+    else:
+        st.info("차입금 항목을 재무상태표에서 찾지 못했습니다. (진단 로그의 BS 항목명을 확인하세요)")
+    st.caption("단기·장기차입금 + 사채 + 유동성장기부채 + 리스부채 포함.")
 
     diag = st.session_state.get("diag", [])
     with st.expander("🔍 진단 정보"):
