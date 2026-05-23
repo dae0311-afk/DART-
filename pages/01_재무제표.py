@@ -32,6 +32,8 @@ UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000
 
 ROMAN = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
 
+PARSER_VER = "v3"
+
 
 # ── 기업코드 검색 ───────────────────────────────────────────────────────────
 
@@ -390,8 +392,8 @@ if "year_data" in st.session_state:
     has_mask = df_full[["매출액", "영업이익"]].notna().any(axis=1)
     if not has_mask.any():
         st.error("선택한 기간 내 공시된 데이터가 없습니다.")
-        with st.expander("🔍 진단 정보"):
-            st.caption(f"기업코드: `{meta.get('corp_code','')}`")
+        with st.expander("🔍 진단 정보", expanded=True):
+            st.caption(f"파서 버전: **{PARSER_VER}** · 기업코드: `{meta.get('corp_code','')}`")
             st.code("\n".join(st.session_state.get("diag", [])) or "로그 없음", language="text")
         st.stop()
 
@@ -450,5 +452,5 @@ if "year_data" in st.session_state:
 
     diag = st.session_state.get("diag", [])
     with st.expander("🔍 진단 정보"):
-        st.caption(f"기업코드: `{meta.get('corp_code','')}`")
+        st.caption(f"파서 버전: **{PARSER_VER}** · 기업코드: `{meta.get('corp_code','')}`")
         st.code("\n".join(diag) if diag else "로그 없음", language="text")
