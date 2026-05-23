@@ -32,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v8"
+PARSER_VER = "v9"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -118,15 +118,31 @@ def stock_to_corp(api_key: str, stock_code: str) -> Optional[dict]:
 
 @st.cache_data(ttl=604_800, show_spinner=False)
 def get_corp_list(api_key: str) -> pd.DataFrame:
-    """전체 기업목록. 디스크(parquet)에 영구 저장 → reboot/캐시클리어에도 재사용."""
-    # 1) 디스크 캐시 우선
+    """
+    기업목록 로드 우선순위:
+    1) 레포 루트의 corpcode.csv (가장 빠름, DART 호출 없음) ← 권장
+    2) /tmp 디스크 캐시
+    3) DART corpCode.xml 실시간 (느림·타임아웃 가능)
+    """
+    # 1) 레포에 커밋된 CSV
+    for path in ("corpcode.csv", "./corpcode.csv", os.path.join(os.path.dirname(__file__), "..", "corpcode.csv")):
+        try:
+            if os.path.exists(path):
+                df = pd.read_csv(path, dtype=str).fillna("")
+                df["stock_code"] = df["stock_code"].str.strip()
+                return df
+        except Exception:
+            continue
+
+    # 2) /tmp 디스크 캐시
     try:
         if os.path.exists(CORP_CACHE_PATH):
             with open(CORP_CACHE_PATH, "rb") as f:
                 return pickle.load(f)
     except Exception:
         pass
-    # 2) 없으면 DART에서 1회 다운로드
+
+    # 3) DART 실시간 (최후)
     resp = http_get(f"{DART_BASE}/corpCode.xml", {"crtfc_key": api_key},
                     connect=10, read=90, retries=3)
     resp.raise_for_status()
