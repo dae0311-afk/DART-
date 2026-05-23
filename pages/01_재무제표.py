@@ -91,9 +91,19 @@ def norm_label(s: str) -> str:
     return s
 
 
-def detect_unit(text: str) -> str:
-    m = re.search(r"단위\s*[:：]\s*(십억원|백만원|억원|천원|원)", text)
-    return m.group(1) if m else "원"
+def detect_unit(text: str) -> Optional[str]:
+    """'(단위 : 천원)', '단위:천원', '단위 천원' 등 유연 탐지"""
+    m = re.search(r"단위[\s:：\(]*?(십억원|백만원|억원|천원|원)", text)
+    return m.group(1) if m else None
+
+
+def detect_unit_near(text: str, anchor_idx: int) -> Optional[str]:
+    """anchor 위치 직전 구간에서 가장 가까운 단위 표기 탐지"""
+    if anchor_idx < 0:
+        return None
+    seg = text[max(0, anchor_idx - 4000): anchor_idx + 200]
+    found = re.findall(r"단위[\s:：\(]*?(십억원|백만원|억원|천원|원)", seg)
+    return found[-1] if found else None
 
 
 # ── 감사보고서 접수번호 찾기 ────────────────────────────────────────────────
@@ -149,7 +159,7 @@ def find_audit_rcept(api_key, corp_code, fy_year, want_cfs, diag) -> tuple[Optio
 # ── 감사보고서 원문 파싱 ────────────────────────────────────────────────────
 
 def parse_document(api_key, rcept_no, diag) -> tuple[Optional[float], Optional[float], str]:
-    """document.xml → 손익계산서에서 매출액·영업이익 추출 (원 단위 정규화)"""
+    """document.xml → 매출액·영업이익 추출 (원 단위 정규화). 실패 시 문맥 덤프."""
     try:
         r = requests.get(f"{DART_BASE}/document.xml",
                          params={"crtfc_key": api_key, "rcept_no": rcept_no}, timeout=40)
@@ -162,45 +172,83 @@ def parse_document(api_key, rcept_no, diag) -> tuple[Optional[float], Optional[f
         diag.append("document.xml → zip 해제 실패")
         return None, None, "원"
 
-    full_text = ""
+    files: list[str] = []
     for name in zf.namelist():
         raw = zf.read(name)
+        txt = None
         for enc in ("utf-8", "cp949", "euc-kr"):
             try:
-                full_text += raw.decode(enc); break
+                txt = raw.decode(enc); break
             except Exception:
                 continue
+        if txt is None:
+            txt = raw.decode("utf-8", errors="ignore")
+        files.append(txt)
+    full_text = "\n".join(files)
 
-    unit = detect_unit(full_text)
-    soup = BeautifulSoup(full_text, "html.parser")
+    def match_rev(L): return L.startswith("매출액") or L.startswith("영업수익") or L.startswith("수익(매출")
+    def match_oi(L):  return L.startswith("영업이익") or L.startswith("영업손실")
 
-    def first_amount_in_row(cells) -> Optional[float]:
+    def pick_amount(cells) -> Optional[float]:
         for c in cells:
-            # 콤마로 묶인 금액 우선 (주석 번호 회피)
-            m = re.search(r"[\(△▲-]?\s*\d{1,3}(?:,\d{3})+\s*\)?", c)
-            if not m:
-                m = re.search(r"[\(△▲-]?\s*\d{4,}\s*\)?", c)
+            m = re.search(r"[\(△▲-]?\s*\d{1,3}(?:,\d{3})+\s*\)?", c) \
+                or re.search(r"[\(△▲-]?\s*\d{4,}\s*\)?", c)
             if m:
                 v = parse_amount(m.group())
-                if v is not None:
+                if v is not None and abs(v) >= 100:
                     return v
         return None
 
-    def scan(match_fn) -> Optional[float]:
-        for tr in soup.find_all("tr"):
-            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"])]
-            if len(cells) < 2:
-                continue
-            label = norm_label(cells[0])
-            if match_fn(label):
-                v = first_amount_in_row(cells[1:])
-                if v is not None:
-                    return v
+    # ── 전략 A: 표 파싱 (파일별로) ──
+    def table_scan(match_fn) -> Optional[float]:
+        for txt in files:
+            soup = BeautifulSoup(txt, "html.parser")
+            for tr in soup.find_all("tr"):
+                cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th", "te"])]
+                if len(cells) < 2:
+                    continue
+                if match_fn(norm_label(cells[0])):
+                    v = pick_amount(cells[1:])
+                    if v is not None:
+                        return v
         return None
 
-    rev = scan(lambda L: L.startswith("매출액") or L.startswith("영업수익") or L.startswith("수익(매출"))
-    oi  = scan(lambda L: L.startswith("영업이익") or L.startswith("영업손실"))
+    # ── 전략 B: 평문 정규식 fallback ──
+    plain = re.sub(r"<[^>]+>", " ", full_text)
+    def text_scan(keywords) -> Optional[float]:
+        for kw in keywords:
+            for m in re.finditer(re.escape(kw), plain):
+                tail = plain[m.end(): m.end() + 60]
+                nm = re.search(r"[\(△▲-]?\s*\d{1,3}(?:,\d{3})+\s*\)?", tail)
+                if nm:
+                    v = parse_amount(nm.group())
+                    if v is not None and abs(v) >= 100:
+                        return v
+        return None
+
+    rev = table_scan(match_rev)
+    oi  = table_scan(match_oi)
+    if rev is None:
+        rev = text_scan(["매출액", "영업수익"])
+    if oi is None:
+        oi = text_scan(["영업이익", "영업손실"])
+
+    # ── 단위: 매출액 위치 근처 우선, 없으면 전역 ──
+    anchor = full_text.find("매출액")
+    if anchor < 0:
+        anchor = full_text.find("영업수익")
+    unit = detect_unit_near(full_text, anchor) or detect_unit(full_text) or "원"
+
     diag.append(f"파싱결과 매출:{rev} 영업이익:{oi} (단위:{unit})")
+
+    # ── 실패 시 진단 덤프 ──
+    if rev is None and oi is None:
+        names = ", ".join(zf.namelist()[:6])
+        diag.append(f"  zip파일({len(files)}): {names}")
+        diag.append(f"  '매출액'존재={'매출액' in full_text} '영업이익'존재={'영업이익' in full_text} '단위'존재={'단위' in full_text}")
+        if anchor >= 0:
+            ctx = re.sub(r"\s+", " ", full_text[anchor: anchor + 120])
+            diag.append(f"  매출액문맥: {ctx}")
 
     mult = UNIT_WON.get(unit, 1)
     return (rev * mult if rev is not None else None,
