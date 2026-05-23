@@ -32,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v9"
+PARSER_VER = "v10"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -430,19 +430,129 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
     return out
 
 
+def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]:
+    """
+    상장사용: fnlttSinglAcntAll(XBRL 정형 재무제표)에서 전 계정 추출.
+    성공 시 dict 반환, 데이터 없으면 None.
+    """
+    fs_primary = "CFS" if want_cfs else "OFS"
+    fs_other   = "OFS" if want_cfs else "CFS"
+
+    def call(fs):
+        try:
+            return http_get(f"{DART_BASE}/fnlttSinglAcntAll.json",
+                {"crtfc_key": api_key, "corp_code": corp_code, "bsns_year": str(year),
+                 "reprt_code": "11011", "fs_div": fs},
+                connect=10, read=30, retries=2).json()
+        except Exception as e:
+            diag.append(f"{year} · AcntAll·{fs} → ERR ({e})")
+            return {"status": "ERR"}
+
+    used_fs, items = None, None
+    for fs in (fs_primary, fs_other):
+        data = call(fs)
+        diag.append(f"{year} · AcntAll·{fs} → {data.get('status')}")
+        if data.get("status") == "000" and data.get("list"):
+            used_fs, items = fs, data["list"]
+            break
+    if not items:
+        return None
+
+    def parse_amt(s):
+        return parse_amount(s)
+
+    def find_acct(matcher, sj=None):
+        for it in items:
+            if sj and it.get("sj_div") != sj:
+                continue
+            nm = (it.get("account_nm") or "").replace(" ", "")
+            if matcher(nm):
+                v = parse_amt(it.get("thstrm_amount"))
+                if v is not None:
+                    return v
+        return None
+
+    out = {
+        "매출액":     find_acct(m_rev, "IS") or find_acct(m_rev, "CIS"),
+        "영업이익":   find_acct(m_oi, "IS")  or find_acct(m_oi, "CIS"),
+        "당기순이익": find_acct(m_ni, "IS")  or find_acct(m_ni, "CIS"),
+        "자산총계":   find_acct(m_asset, "BS"),
+        "부채총계":   find_acct(m_liab, "BS"),
+        "자본총계":   find_acct(m_equity, "BS"),
+    }
+    # 현금/차입금 구성 (BS)
+    cash_bd, debt_bd = {}, {}
+    for name, mf in CASH_SPECS:
+        for it in items:
+            if it.get("sj_div") != "BS":
+                continue
+            nm = (it.get("account_nm") or "").replace(" ", "")
+            if mf(nm):
+                v = parse_amt(it.get("thstrm_amount"))
+                if v is not None:
+                    cash_bd[name] = cash_bd.get(name, 0) + v
+                break
+    for name, mf in DEBT_SPECS:
+        for it in items:
+            if it.get("sj_div") != "BS":
+                continue
+            nm = (it.get("account_nm") or "").replace(" ", "")
+            if mf(nm):
+                v = parse_amt(it.get("thstrm_amount"))
+                if v is not None:
+                    debt_bd[name] = debt_bd.get(name, 0) + v
+                break
+    out["cash_bd"] = cash_bd
+    out["debt_bd"] = debt_bd
+    out["현금성자산"] = sum(cash_bd.values()) if cash_bd else None
+    out["총차입금"]   = sum(debt_bd.values()) if debt_bd else None
+
+    # D&A: 현금흐름표(CF) 가산항목 합산
+    da, da_hit = 0.0, False
+    for it in items:
+        if it.get("sj_div") != "CF":
+            continue
+        nm = (it.get("account_nm") or "").replace(" ", "")
+        if m_dep(nm) or m_amort(nm) or m_rou(nm):
+            v = parse_amt(it.get("thstrm_amount"))
+            if v is not None:
+                da += abs(v); da_hit = True
+    out["DA"] = da if da_hit else None
+    out["DA_src"] = "현금흐름표(XBRL)" if da_hit else "미발견"
+
+    if out["영업이익"] is not None and da_hit:
+        out["EBITDA"] = out["영업이익"] + da
+    else:
+        out["EBITDA"] = None
+
+    out["kind"] = "연결" if used_fs == "CFS" else "별도"
+    out["source"] = "정형(XBRL)"
+    diag.append(f"{year} · 정형추출 매출:{out['매출액']} 영업:{out['영업이익']} "
+                f"EBITDA:{out['EBITDA']} ({out['kind']})")
+    return out
+
+
 @st.cache_data(ttl=3_600, show_spinner=False)
-def fetch_year(api_key, corp_code, year, want_cfs) -> dict:
+def fetch_year(api_key, corp_code, year, want_cfs, is_listed) -> dict:
     diag = []
+    # 1) 상장사: 정형 API 우선
+    if is_listed:
+        st_data = fetch_structured(api_key, corp_code, year, want_cfs, diag)
+        if st_data and (st_data.get("매출액") is not None or st_data.get("자산총계") is not None):
+            st_data["diag"] = diag
+            return st_data
+    # 2) (비상장 또는 정형 실패) 감사보고서 파싱
     rcept, kind = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)
     if not rcept:
         return {"kind": "없음", "diag": diag}
     data = parse_financials(api_key, rcept, diag)
     data["kind"] = kind
+    data["source"] = "감사보고서"
     data["diag"] = diag
     return data
 
 
-def run_fetch(corp_code, want_cfs, period):
+def run_fetch(corp_code, want_cfs, period, is_listed):
     max_mode = (period == "최대")
     if max_mode:
         years_to_fetch = list(range(LATEST_YEAR, 1998, -1))
@@ -453,7 +563,7 @@ def run_fetch(corp_code, want_cfs, period):
     year_data, all_diag = {}, []
     consec, found = 0, False
     for yr in years_to_fetch:
-        d = fetch_year(API_KEY, corp_code, yr, want_cfs)
+        d = fetch_year(API_KEY, corp_code, yr, want_cfs, is_listed)
         year_data[yr] = d
         all_diag.extend(d.get("diag", []))
         has = any(d.get(k) is not None for k in ("매출액", "자산총계", "영업이익"))
@@ -552,7 +662,10 @@ if "search_results" in st.session_state:
     chosen   = results.iloc[chosen_i]
     st.divider()
     if st.button("📥 재무데이터 조회", type="primary", use_container_width=True):
-        st.session_state["active_corp"] = {"corp_code": chosen["corp_code"], "corp_name": chosen["corp_name"]}
+        st.session_state["active_corp"] = {
+            "corp_code": chosen["corp_code"], "corp_name": chosen["corp_name"],
+            "is_listed": bool(str(chosen["stock_code"]).strip()),
+        }
         st.session_state.pop("fetch_sig", None)
 
 # ── 조회 실행 (옵션 변경 시 자동) ───────────────────────────────────────────
@@ -560,8 +673,9 @@ if "active_corp" in st.session_state:
     ac  = st.session_state["active_corp"]
     sig = (ac["corp_code"], want_cfs, period)
     if st.session_state.get("fetch_sig") != sig:
-        with st.spinner("감사보고서 조회 중…"):
-            year_data, disp_start, all_diag, max_mode = run_fetch(ac["corp_code"], want_cfs, period)
+        with st.spinner("재무데이터 조회 중…"):
+            year_data, disp_start, all_diag, max_mode = run_fetch(
+                ac["corp_code"], want_cfs, period, ac.get("is_listed", False))
         st.session_state["year_data"]   = year_data
         st.session_state["disp_start"]  = disp_start
         st.session_state["result_meta"] = {"corp_name": ac["corp_name"], "corp_code": ac["corp_code"],
