@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import datetime
 import io
+import os
+import pickle
 import re
 import zipfile
 import xml.etree.ElementTree as ET
@@ -30,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v7"
+PARSER_VER = "v8"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -83,9 +85,48 @@ DEBT_SPECS = [
 
 
 # ── 기업코드 검색 ───────────────────────────────────────────────────────────
-@st.cache_data(ttl=86_400, show_spinner=False)
+CORP_CACHE_PATH = "/tmp/dart_corpcode.pkl"
+
+
+def lookup_by_code(api_key: str, corp_code: str) -> Optional[dict]:
+    """8자리 기업코드 단건 조회 (company.json, 매우 가벼움)"""
+    try:
+        data = http_get(f"{DART_BASE}/company.json",
+                        {"crtfc_key": api_key, "corp_code": corp_code},
+                        connect=8, read=15, retries=2).json()
+    except Exception:
+        return None
+    if data.get("status") != "000":
+        return None
+    return {
+        "corp_code":  corp_code,
+        "corp_name":  data.get("corp_name", ""),
+        "stock_code": (data.get("stock_code") or "").strip(),
+    }
+
+
+def stock_to_corp(api_key: str, stock_code: str) -> Optional[dict]:
+    """종목코드(6자리) → 기업코드 변환. 전체목록 캐시가 있으면 그걸로, 없으면 받아서."""
+    df = get_corp_list(api_key)   # 종목코드 매핑은 목록이 필요
+    hit = df[df["stock_code"] == stock_code]
+    if hit.empty:
+        return None
+    row = hit.iloc[0]
+    return {"corp_code": row["corp_code"], "corp_name": row["corp_name"],
+            "stock_code": row["stock_code"]}
+
+
+@st.cache_data(ttl=604_800, show_spinner=False)
 def get_corp_list(api_key: str) -> pd.DataFrame:
-    # corpCode.xml은 대용량 zip → 읽기 타임아웃 넉넉히, 재시도
+    """전체 기업목록. 디스크(parquet)에 영구 저장 → reboot/캐시클리어에도 재사용."""
+    # 1) 디스크 캐시 우선
+    try:
+        if os.path.exists(CORP_CACHE_PATH):
+            with open(CORP_CACHE_PATH, "rb") as f:
+                return pickle.load(f)
+    except Exception:
+        pass
+    # 2) 없으면 DART에서 1회 다운로드
     resp = http_get(f"{DART_BASE}/corpCode.xml", {"crtfc_key": api_key},
                     connect=10, read=90, retries=3)
     resp.raise_for_status()
@@ -94,20 +135,42 @@ def get_corp_list(api_key: str) -> pd.DataFrame:
     root = ET.fromstring(xml_bytes)
     rows = [{"corp_code": it.findtext("corp_code", ""), "corp_name": it.findtext("corp_name", ""),
              "stock_code": (it.findtext("stock_code") or "").strip()} for it in root.findall("list")]
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    try:
+        with open(CORP_CACHE_PATH, "wb") as f:
+            pickle.dump(df, f)
+    except Exception:
+        pass
+    return df
 
 
 def search_corp(api_key: str, query: str) -> tuple[pd.DataFrame, str]:
-    df = get_corp_list(api_key); q = query.strip()
+    """
+    코드 입력 → 단건 즉시조회 (전체목록 불필요).
+    회사명 입력 → 전체목록(디스크 캐시)에서 검색.
+    """
+    q = query.strip()
+
+    # 8자리 기업코드: 단건 API로 즉시
+    if q.isdigit() and len(q) == 8:
+        rec = lookup_by_code(api_key, q)
+        if rec:
+            return pd.DataFrame([rec]), f"DART 기업코드 {q}"
+        return pd.DataFrame(), f"DART 기업코드 {q}"
+
+    # 6자리 종목코드: 목록에서 코드 변환 (가벼운 매핑)
     if q.isdigit() and len(q) == 6:
-        result = df[df["stock_code"] == q].copy(); mode = f"종목코드 {q}"
-    elif q.isdigit() and len(q) == 8:
-        result = df[df["corp_code"] == q].copy(); mode = f"DART 기업코드 {q}"
-    else:
-        result = df[df["corp_name"].str.contains(q, na=False, regex=False)].copy(); mode = f"회사명 '{q}'"
+        rec = stock_to_corp(api_key, q)
+        if rec:
+            return pd.DataFrame([rec]), f"종목코드 {q}"
+        return pd.DataFrame(), f"종목코드 {q}"
+
+    # 회사명: 전체목록 검색
+    df = get_corp_list(api_key)
+    result = df[df["corp_name"].str.contains(q, na=False, regex=False)].copy()
     result["_listed"] = result["stock_code"].str.strip().ne("")
     result = result.sort_values("_listed", ascending=False).drop(columns="_listed")
-    return result.reset_index(drop=True), mode
+    return result.reset_index(drop=True), f"회사명 '{q}'"
 
 
 # ── 파싱 유틸 ───────────────────────────────────────────────────────────────
