@@ -32,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v12"
+PARSER_VER = "v13"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -554,8 +554,23 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
             rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)  # 보조
         if rcept:
             doc = parse_financials(api_key, rcept, diag)
-            if doc.get("DA") is not None:
-                da = doc["DA"]; da_hit = True; da_src = "원문(CF)"
+            doc_da = doc.get("DA")
+            doc_oi = doc.get("영업이익")
+            xbrl_oi = out.get("영업이익")
+            if doc_da is not None:
+                # 단위 일관성 보정: 문서 영업이익과 XBRL 영업이익 비율로 D&A 스케일 맞춤
+                if doc_oi and xbrl_oi and doc_oi != 0:
+                    scale = xbrl_oi / doc_oi
+                    # 스케일이 1000배/0.001배 근처면 단위 차이 → 보정
+                    if 0.0005 < abs(scale) < 2000:
+                        doc_da = doc_da * scale
+                        diag.append(f"{year} · D&A 단위보정 scale={scale:.4g}")
+                da = doc_da; da_hit = True; da_src = "원문(CF)"
+
+    # 최종 방어: D&A가 영업이익의 5배 초과면 단위오류로 간주, EBITDA 공란
+    if da_hit and out.get("영업이익") and abs(da) > abs(out["영업이익"]) * 5:
+        diag.append(f"{year} · D&A 비현실값({da:.3g}) → EBITDA 공란")
+        da_hit = False
 
     out["DA"] = da if da_hit else None
     out["DA_src"] = da_src if da_hit else "미발견"
@@ -836,6 +851,12 @@ if "year_data" in st.session_state:
     # ── 차트 헬퍼 ──
     yr_str = [str(y) for y in ys]
 
+    def chart_title(text):
+        st.markdown(
+            f'<div style="background:#EDEDED;padding:8px 14px;border-radius:6px;'
+            f'font-size:16px;font-weight:600;color:#222;text-align:center;'
+            f'margin:6px 0 16px 0;">{text}</div>', unsafe_allow_html=True)
+
     def bar_line(title, bar_key, line_fn, line_name, bar_color="#1E3D6B"):
         bar_vals  = [val(y, bar_key) for y in ys]
         line_vals = [line_fn(y) for y in ys]
@@ -848,16 +869,16 @@ if "year_data" in st.session_state:
         y_bot = bar_min * 1.2 if bar_min < 0 else 0
 
         # 라인은 차트 상단 영역에만 뜨게: 우축 범위를 아래로 크게 늘려
-        # (라인 데이터가 위쪽 1/4 구간에 위치 → 막대와 라벨 겹침 방지)
         lvals = [v for v in line_vals if v is not None]
         if lvals:
             lmin, lmax = min(lvals), max(lvals)
             span = (lmax - lmin) or abs(lmax) or 1
             y2_top = lmax + span * 0.5
-            y2_bot = lmin - span * 4.0      # 하한을 멀리 → 라인이 상단에 압축
+            y2_bot = lmin - span * 4.0
         else:
             y2_bot, y2_top = 0, 1
 
+        chart_title(title)
         fig = go.Figure()
         fig.add_trace(go.Bar(
             x=yr_str, y=bar_vals, name=title.split("·")[0].strip(),
@@ -871,15 +892,14 @@ if "year_data" in st.session_state:
             text=[fmt_pct(v) for v in line_vals], textposition="top center",
             textfont=dict(size=13, color="#B5651D"), cliponaxis=False))
         fig.update_layout(
-            title=dict(text=title, font=dict(size=16)),
             plot_bgcolor="white", paper_bgcolor="white",
             yaxis=dict(visible=False, range=[y_bot, y_top]),
             yaxis2=dict(overlaying="y", side="right", visible=False, range=[y2_bot, y2_top]),
             xaxis=dict(type="category", showgrid=False, tickfont=dict(size=14),
-                       showline=False, zeroline=False),
-            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1,
+                       showline=True, linecolor="black", linewidth=1.5, zeroline=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5,
                         font=dict(size=13)),
-            margin=dict(t=70, b=30, l=20, r=20), height=380, bargap=0.55)
+            margin=dict(t=60, b=30, l=20, r=20), height=380, bargap=0.55)
         st.plotly_chart(fig, use_container_width=True,
                         config={"staticPlot": True, "displayModeBar": False})
 
@@ -904,13 +924,14 @@ if "year_data" in st.session_state:
             line=dict(color=color, width=2.5), marker=dict(size=6),
             text=[fmt_val(v) if v is not None else "" for v in yv],
             textposition="top center", textfont=dict(size=11, color=color), cliponaxis=False))
+    chart_title("재무상태 (자산·부채·자본 / 현금성자산·총차입금)")
     fig5.update_layout(
-        title=dict(text="재무상태 (자산·부채·자본 / 현금성자산·총차입금)", font=dict(size=16)),
         plot_bgcolor="white", paper_bgcolor="white",
         yaxis=dict(visible=False),
-        xaxis=dict(type="category", showgrid=False, tickfont=dict(size=14), showline=False, zeroline=False),
-        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1, font=dict(size=13)),
-        margin=dict(t=70, b=30, l=20, r=20), height=420)
+        xaxis=dict(type="category", showgrid=False, tickfont=dict(size=14),
+                   showline=True, linecolor="black", linewidth=1.5, zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="center", x=0.5, font=dict(size=13)),
+        margin=dict(t=60, b=30, l=20, r=20), height=430)
     st.plotly_chart(fig5, use_container_width=True,
                     config={"staticPlot": True, "displayModeBar": False})
 
