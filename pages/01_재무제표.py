@@ -30,7 +30,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v5"
+PARSER_VER = "v6"
 
 # ── 계정 매처 (정규화 라벨 기준) ───────────────────────────────────────────
 def m_rev(L):  return L.startswith("매출액") or L.startswith("영업수익") or L.startswith("수익(매출") or L == "매출"
@@ -304,6 +304,26 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
 
     diag.append(f"매출:{out['매출액']} 영업:{out['영업이익']} 순익:{out['당기순이익']} "
                 f"D&A:{out['DA']}({out['DA_src']}) EBITDA:{out['EBITDA']} 자산:{out['자산총계']} (단위:{unit})")
+
+    # 차입금/현금 미발견 시 BS 후보 항목명 덤프 (매처 보정용)
+    if not debt_bd or not cash_bd:
+        bs_labels = []
+        for label, cells, sec in rows:
+            if sec == "BS" and label and any(kw in label for kw in
+                    ("차입", "사채", "리스", "현금", "금융상품", "금융자산", "투자자산", "예금")):
+                if label not in bs_labels:
+                    bs_labels.append(label)
+        if bs_labels:
+            diag.append("  BS후보(차입/현금): " + " | ".join(bs_labels[:25]))
+        else:
+            # 섹션 태깅이 실패했을 수도 → 전체에서 탐색
+            all_labels = []
+            for label, cells, sec in rows:
+                if label and any(kw in label for kw in ("차입", "사채", "리스부채", "현금및현금")):
+                    if label not in all_labels:
+                        all_labels.append(label)
+            diag.append("  전체후보(차입/현금): " + (" | ".join(all_labels[:25]) or "없음"))
+
     if out["매출액"] is None and out["자산총계"] is None:
         diag.append(f"  '매출액'존재={'매출액' in full_text} '자산총계'존재={'자산총계' in full_text}")
         if anchor >= 0:
@@ -585,23 +605,32 @@ if "year_data" in st.session_state:
         for y in ys:
             comps += list(year_data[y].get(bd_key, {}).keys())
         comps = list(dict.fromkeys(comps))  # 순서 유지 중복 제거
+
         rows = {}
         for comp in comps:
-            rows[comp] = [(year_data[y].get(bd_key, {}).get(comp, None)) for y in ys]
-        # 합계
+            rows[comp] = [year_data[y].get(bd_key, {}).get(comp, None) for y in ys]
         rows["합계"] = [raw(y, total_key) for y in ys]
+
         df = pd.DataFrame(rows, index=[str(y) for y in ys]).T
-        # 표시단위 환산 + 포맷
-        return df.applymap(lambda v: fmt_val(v / div) if v is not None else "—")
+        # 표시단위 환산 + 포맷 (pandas 3.x: applymap 제거됨 → map 사용)
+        return df.map(lambda v: fmt_val(v / div) if v is not None else "—")
 
     cc, dc = st.columns(2)
     with cc:
         st.markdown("**현금성자산 구성**")
-        st.dataframe(breakdown_df("cash_bd", "현금성자산"), use_container_width=True)
+        cash_has = any(year_data[y].get("cash_bd") for y in ys)
+        if cash_has:
+            st.dataframe(breakdown_df("cash_bd", "현금성자산"), use_container_width=True)
+        else:
+            st.info("현금성자산 세부 항목을 재무상태표에서 찾지 못했습니다.")
         st.caption("순부채 산정용. 현금및현금성자산 + 단기금융상품/투자자산 등 valuation 관점 포함.")
     with dc:
         st.markdown("**총차입금 구성**")
-        st.dataframe(breakdown_df("debt_bd", "총차입금"), use_container_width=True)
+        debt_has = any(year_data[y].get("debt_bd") for y in ys)
+        if debt_has:
+            st.dataframe(breakdown_df("debt_bd", "총차입금"), use_container_width=True)
+        else:
+            st.info("차입금 항목을 재무상태표에서 찾지 못했습니다. (진단 로그의 BS 항목명을 확인하세요)")
         st.caption("단기·장기차입금 + 사채 + 유동성장기부채 + 리스부채 포함.")
 
     diag = st.session_state.get("diag", [])
