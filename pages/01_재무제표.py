@@ -30,7 +30,23 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v6"
+PARSER_VER = "v7"
+
+
+# ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
+def http_get(url, params, connect=10, read=60, retries=3):
+    """ConnectTimeout/일시적 오류 시 backoff 재시도. 최종 실패 시 예외 전파."""
+    import time
+    last = None
+    for i in range(retries):
+        try:
+            return requests.get(url, params=params, timeout=(connect, read))
+        except requests.exceptions.RequestException as e:
+            last = e
+            if i < retries - 1:
+                time.sleep(2 * (i + 1))
+    raise last
+
 
 # ── 계정 매처 (정규화 라벨 기준) ───────────────────────────────────────────
 def m_rev(L):  return L.startswith("매출액") or L.startswith("영업수익") or L.startswith("수익(매출") or L == "매출"
@@ -69,7 +85,9 @@ DEBT_SPECS = [
 # ── 기업코드 검색 ───────────────────────────────────────────────────────────
 @st.cache_data(ttl=86_400, show_spinner=False)
 def get_corp_list(api_key: str) -> pd.DataFrame:
-    resp = requests.get(f"{DART_BASE}/corpCode.xml", params={"crtfc_key": api_key}, timeout=30)
+    # corpCode.xml은 대용량 zip → 읽기 타임아웃 넉넉히, 재시도
+    resp = http_get(f"{DART_BASE}/corpCode.xml", {"crtfc_key": api_key},
+                    connect=10, read=90, retries=3)
     resp.raise_for_status()
     with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
         xml_bytes = zf.read("CORPCODE.xml")
@@ -129,10 +147,11 @@ def detect_unit_near(text: str, anchor: int) -> Optional[str]:
 def find_audit_rcept(api_key, corp_code, fy_year, want_cfs, diag):
     for filing_year in (fy_year + 1, fy_year + 2):
         try:
-            data = requests.get(f"{DART_BASE}/list.json",
-                params={"crtfc_key": api_key, "corp_code": corp_code,
-                        "bgn_de": f"{filing_year}0101", "end_de": f"{filing_year}1231",
-                        "pblntf_ty": "F", "page_count": 100}, timeout=15).json()
+            data = http_get(f"{DART_BASE}/list.json",
+                {"crtfc_key": api_key, "corp_code": corp_code,
+                 "bgn_de": f"{filing_year}0101", "end_de": f"{filing_year}1231",
+                 "pblntf_ty": "F", "page_count": 100},
+                connect=10, read=30, retries=3).json()
         except Exception as e:
             diag.append(f"{fy_year} · list.json → ERR ({e})"); continue
         if data.get("status") != "000":
@@ -226,8 +245,9 @@ def sum_values(rows, matcher, section=None):
 
 def parse_financials(api_key, rcept_no, diag) -> dict:
     try:
-        r = requests.get(f"{DART_BASE}/document.xml",
-                         params={"crtfc_key": api_key, "rcept_no": rcept_no}, timeout=40)
+        r = http_get(f"{DART_BASE}/document.xml",
+                     {"crtfc_key": api_key, "rcept_no": rcept_no},
+                     connect=10, read=60, retries=2)
         zf = zipfile.ZipFile(io.BytesIO(r.content))
     except Exception as e:
         diag.append(f"document → ERR ({e})")
@@ -423,15 +443,25 @@ with st.form("search_form"):
         search_btn = st.form_submit_button("🔍 검색", use_container_width=True)
 
 if search_btn and query.strip():
-    with st.spinner("기업 검색 중…"):
-        results, search_mode = search_corp(API_KEY, query.strip())
-    if results.empty:
-        st.error(f"'{query}' 검색 결과가 없습니다.")
+    try:
+        with st.spinner("기업 검색 중… (최초 1회는 DART 전체 기업목록을 받아 다소 걸립니다)"):
+            results, search_mode = search_corp(API_KEY, query.strip())
+    except requests.exceptions.RequestException as e:
+        st.error(
+            "⏱️ DART 서버 연결에 실패했습니다 (일시적 지연일 수 있음).\n\n"
+            "잠시 후 다시 검색하거나, 우측 하단 **Manage app → Clear cache** 후 재시도하세요."
+        )
+        with st.expander("오류 상세"):
+            st.code(f"{type(e).__name__}: {e}")
+        st.stop()
     else:
-        st.success(f"**{search_mode}** 기준으로 {len(results)}개 검색됨")
-        st.session_state["search_results"] = results
-        for k in ("year_data", "disp_start", "result_meta", "active_corp", "fetch_sig"):
-            st.session_state.pop(k, None)
+        if results.empty:
+            st.error(f"'{query}' 검색 결과가 없습니다.")
+        else:
+            st.success(f"**{search_mode}** 기준으로 {len(results)}개 검색됨")
+            st.session_state["search_results"] = results
+            for k in ("year_data", "disp_start", "result_meta", "active_corp", "fetch_sig"):
+                st.session_state.pop(k, None)
 
 # ── 회사 선택 ──────────────────────────────────────────────────────────────
 if "search_results" in st.session_state:
