@@ -32,7 +32,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v11"
+PARSER_VER = "v12"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -223,6 +223,27 @@ def detect_unit_near(text: str, anchor: int) -> Optional[str]:
 
 
 # ── 감사보고서 접수번호 ─────────────────────────────────────────────────────
+def find_report_rcept(api_key, corp_code, fy_year, diag):
+    """상장사 사업보고서(정기공시 A) 접수번호 — 현금흐름표 원문 파싱용"""
+    for filing_year in (fy_year + 1, fy_year + 2):
+        try:
+            data = http_get(f"{DART_BASE}/list.json",
+                {"crtfc_key": api_key, "corp_code": corp_code,
+                 "bgn_de": f"{filing_year}0101", "end_de": f"{filing_year}1231",
+                 "pblntf_ty": "A", "page_count": 100},
+                connect=10, read=30, retries=2).json()
+        except Exception as e:
+            diag.append(f"{fy_year} · 사업보고서 list → ERR ({e})"); continue
+        if data.get("status") != "000":
+            continue
+        for it in data.get("list", []):
+            nm = it.get("report_nm", "")
+            if "사업보고서" in nm:
+                diag.append(f"{fy_year} · 사업보고서 rcept {it.get('rcept_no')}")
+                return it.get("rcept_no")
+    return None
+
+
 def find_audit_rcept(api_key, corp_code, fy_year, want_cfs, diag):
     for filing_year in (fy_year + 1, fy_year + 2):
         try:
@@ -526,9 +547,11 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
                 da += abs(v); da_hit = True
     da_src = "XBRL"
 
-    # XBRL에 D&A 없으면 → 사업보고서/감사보고서 원문에서 보강
+    # XBRL에 D&A 없으면 → 사업보고서 원문(현금흐름표)에서 보강 (상장사 핵심 경로)
     if not da_hit:
-        rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)
+        rcept = find_report_rcept(api_key, corp_code, year, diag)   # 사업보고서(A)
+        if not rcept:
+            rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)  # 보조
         if rcept:
             doc = parse_financials(api_key, rcept, diag)
             if doc.get("DA") is not None:
@@ -817,48 +840,53 @@ if "year_data" in st.session_state:
         bar_vals  = [val(y, bar_key) for y in ys]
         line_vals = [line_fn(y) for y in ys]
 
-        # 막대: 최대값이 축의 2/3 지점에 오도록 y축 상한 = max*1.5
+        # 막대는 차트 하단 0~2/3 영역에만: y축 상한 = max*1.5
         bvals = [v for v in bar_vals if v is not None]
         bar_max = max(bvals) if bvals else 1
         bar_min = min(bvals + [0]) if bvals else 0
         y_top = bar_max * 1.5 if bar_max > 0 else 1
         y_bot = bar_min * 1.2 if bar_min < 0 else 0
 
-        # 라인: 상단 1/3 영역에 놓이도록 우축 범위를 넓게 (겹침 최소화)
+        # 라인은 차트 상단 영역에만 뜨게: 우축 범위를 아래로 크게 늘려
+        # (라인 데이터가 위쪽 1/4 구간에 위치 → 막대와 라벨 겹침 방지)
         lvals = [v for v in line_vals if v is not None]
         if lvals:
             lmin, lmax = min(lvals), max(lvals)
-            pad = (lmax - lmin) * 0.3 or abs(lmax) * 0.3 or 1
-            # 라인을 위쪽에 배치: 하한을 낮춰 라인이 차트 상단에 뜨게
-            y2_bot = lmin - pad * 4
-            y2_top = lmax + pad
+            span = (lmax - lmin) or abs(lmax) or 1
+            y2_top = lmax + span * 0.5
+            y2_bot = lmin - span * 4.0      # 하한을 멀리 → 라인이 상단에 압축
         else:
             y2_bot, y2_top = 0, 1
 
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=yr_str, y=bar_vals,
-            name=title.split("·")[0].strip(),
-            marker_color=bar_color, yaxis="y", width=0.45,
-            text=[fmt_val(v) for v in bar_vals], textposition="outside", textfont=dict(size=10)))
+            x=yr_str, y=bar_vals, name=title.split("·")[0].strip(),
+            marker_color=bar_color, yaxis="y", width=0.4,
+            text=[fmt_val(v) for v in bar_vals], textposition="outside",
+            textfont=dict(size=14, color="#1E3D6B"), cliponaxis=False))
         fig.add_trace(go.Scatter(
             x=yr_str, y=line_vals, name=line_name, yaxis="y2",
-            mode="lines+markers+text", line=dict(color="#E67E22", width=2),
-            text=[fmt_pct(v) for v in line_vals], textposition="top center", textfont=dict(size=9, color="#B5651D")))
+            mode="lines+markers+text", line=dict(color="#E67E22", width=2.5),
+            marker=dict(size=7),
+            text=[fmt_pct(v) for v in line_vals], textposition="top center",
+            textfont=dict(size=13, color="#B5651D"), cliponaxis=False))
         fig.update_layout(
-            title=title, plot_bgcolor="white", paper_bgcolor="white",
-            yaxis=dict(title=display_unit, gridcolor="#EBEBEB", range=[y_bot, y_top]),
-            yaxis2=dict(overlaying="y", side="right", showgrid=False, ticksuffix="%",
-                        range=[y2_bot, y2_top]),
-            xaxis=dict(type="category"),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(t=60, b=30, l=60, r=60), height=360, bargap=0.5)
-        st.plotly_chart(fig, use_container_width=True)
+            title=dict(text=title, font=dict(size=16)),
+            plot_bgcolor="white", paper_bgcolor="white",
+            yaxis=dict(visible=False, range=[y_bot, y_top]),
+            yaxis2=dict(overlaying="y", side="right", visible=False, range=[y2_bot, y2_top]),
+            xaxis=dict(type="category", showgrid=False, tickfont=dict(size=14),
+                       showline=False, zeroline=False),
+            legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1,
+                        font=dict(size=13)),
+            margin=dict(t=70, b=30, l=20, r=20), height=380, bargap=0.55)
+        st.plotly_chart(fig, use_container_width=True,
+                        config={"staticPlot": True, "displayModeBar": False})
 
-    bar_line(f"매출액 · 성장률", "매출액", growth, "성장률(%)")
-    bar_line(f"EBITDA · 마진", "EBITDA", lambda y: margin(y, "EBITDA"), "EBITDA 마진(%)")
-    bar_line(f"영업이익 · 마진", "영업이익", lambda y: margin(y, "영업이익"), "영업이익률(%)")
-    bar_line(f"당기순이익 · 마진", "당기순이익", lambda y: margin(y, "당기순이익"), "순이익률(%)")
+    bar_line("매출액 · 성장률", "매출액", growth, "성장률(%)")
+    bar_line("EBITDA · 마진", "EBITDA", lambda y: margin(y, "EBITDA"), "EBITDA 마진(%)")
+    bar_line("영업이익 · 마진", "영업이익", lambda y: margin(y, "영업이익"), "영업이익률(%)")
+    bar_line("당기순이익 · 마진", "당기순이익", lambda y: margin(y, "당기순이익"), "순이익률(%)")
 
     # 5번째: BS 멀티라인
     bs_series = [
@@ -870,45 +898,65 @@ if "year_data" in st.session_state:
     ]
     fig5 = go.Figure()
     for name, key, color in bs_series:
-        fig5.add_trace(go.Scatter(x=yr_str, y=[val(y, key) for y in ys], name=name,
-                                  mode="lines+markers", line=dict(color=color, width=2)))
-    fig5.update_layout(title="재무상태 (자산·부채·자본 / 현금성자산·총차입금)",
-                       plot_bgcolor="white", paper_bgcolor="white",
-                       yaxis=dict(title=display_unit, gridcolor="#EBEBEB"), xaxis=dict(type="category"),
-                       legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                       margin=dict(t=60, b=30, l=60, r=20), height=380)
-    st.plotly_chart(fig5, use_container_width=True)
+        yv = [val(y, key) for y in ys]
+        fig5.add_trace(go.Scatter(
+            x=yr_str, y=yv, name=name, mode="lines+markers+text",
+            line=dict(color=color, width=2.5), marker=dict(size=6),
+            text=[fmt_val(v) if v is not None else "" for v in yv],
+            textposition="top center", textfont=dict(size=11, color=color), cliponaxis=False))
+    fig5.update_layout(
+        title=dict(text="재무상태 (자산·부채·자본 / 현금성자산·총차입금)", font=dict(size=16)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        yaxis=dict(visible=False),
+        xaxis=dict(type="category", showgrid=False, tickfont=dict(size=14), showline=False, zeroline=False),
+        legend=dict(orientation="h", yanchor="bottom", y=1.04, xanchor="right", x=1, font=dict(size=13)),
+        margin=dict(t=70, b=30, l=20, r=20), height=420)
+    st.plotly_chart(fig5, use_container_width=True,
+                    config={"staticPlot": True, "displayModeBar": False})
 
-    # ── 구성 테이블 (현금성자산 / 총차입금) ──
-    def breakdown_df(bd_key, total_key):
+    # ── 구성 테이블 (요약표와 동일한 우측정렬 HTML) ──
+    def breakdown_html(bd_key, total_key):
         comps = []
         for y in ys:
             comps += list(year_data[y].get(bd_key, {}).keys())
-        comps = list(dict.fromkeys(comps))  # 순서 유지 중복 제거
+        comps = list(dict.fromkeys(comps))
 
-        rows = {}
+        header = "".join(f'<th style="background:#3A4A5E;color:#fff;text-align:right;padding:6px 12px;">{y}</th>' for y in ys)
+        body = ""
         for comp in comps:
-            rows[comp] = [year_data[y].get(bd_key, {}).get(comp, None) for y in ys]
-        rows["합계"] = [raw(y, total_key) for y in ys]
+            tds = ""
+            for y in ys:
+                v = year_data[y].get(bd_key, {}).get(comp, None)
+                cell = fmt_val(v / div) if v is not None else "—"
+                tds += f'<td style="text-align:right;padding:5px 12px;">{cell}</td>'
+            body += f'<tr><td style="padding:5px 10px 5px 22px;color:#333;">{comp}</td>{tds}</tr>'
+        # 합계
+        stds = ""
+        for y in ys:
+            v = raw(y, total_key)
+            cell = fmt_val(v / div) if v is not None else "—"
+            stds += f'<td style="text-align:right;padding:6px 12px;font-weight:600;">{cell}</td>'
+        body += f'<tr><td style="padding:6px 10px;font-weight:600;">합계</td>{stds}</tr>'
 
-        df = pd.DataFrame(rows, index=[str(y) for y in ys]).T
-        # 표시단위 환산 + 포맷 (pandas 3.x: applymap 제거됨 → map 사용)
-        return df.map(lambda v: fmt_val(v / div) if v is not None else "—")
+        return f"""
+        <table style="border-collapse:collapse;width:100%;font-size:0.9rem;">
+          <tr><th style="background:#3A4A5E;color:#fff;text-align:left;padding:6px 10px;">(단위 : {display_unit})</th>{header}</tr>
+          {body}
+        </table>
+        """
 
     st.divider()
     st.markdown("**현금성자산 구성**")
-    cash_has = any(year_data[y].get("cash_bd") for y in ys)
-    if cash_has:
-        st.dataframe(breakdown_df("cash_bd", "현금성자산"), use_container_width=True)
+    if any(year_data[y].get("cash_bd") for y in ys):
+        st.markdown(breakdown_html("cash_bd", "현금성자산"), unsafe_allow_html=True)
     else:
         st.info("현금성자산 세부 항목을 재무상태표에서 찾지 못했습니다.")
     st.caption("순부채 산정용. 현금및현금성자산 + 단기금융상품/투자자산 등 valuation 관점 포함.")
 
     st.write("")
     st.markdown("**총차입금 구성**")
-    debt_has = any(year_data[y].get("debt_bd") for y in ys)
-    if debt_has:
-        st.dataframe(breakdown_df("debt_bd", "총차입금"), use_container_width=True)
+    if any(year_data[y].get("debt_bd") for y in ys):
+        st.markdown(breakdown_html("debt_bd", "총차입금"), unsafe_allow_html=True)
     else:
         st.info("차입금 항목을 재무상태표에서 찾지 못했습니다. (진단 로그의 BS 항목명을 확인하세요)")
     st.caption("단기·장기차입금 + 사채 + 유동성장기부채 + 리스부채 포함.")
