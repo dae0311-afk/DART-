@@ -162,37 +162,33 @@ def build_df(years, records_map, dart_unit, display_unit) -> pd.DataFrame:
 with st.sidebar:
     st.header("⚙️ 조회 옵션")
 
-    fs_div = st.radio(
+    fs_div_label = st.segmented_control(
         "재무제표 구분",
-        options=["CFS", "OFS"],
-        format_func=lambda x: "연결 (CFS)" if x == "CFS" else "별도 (OFS)",
-        index=0,
-        horizontal=True,
+        options=["연결", "별도"],
+        default="연결",
     )
+    fs_div = "CFS" if fs_div_label == "연결" else "OFS"
 
-    period = st.radio(
+    period = st.segmented_control(
         "조회 기간",
         options=[5, 10, 20],
         format_func=lambda x: f"{x}년",
-        index=0,
-        horizontal=True,
+        default=5,
     )
 
-    display_unit = st.radio(
+    display_unit = st.segmented_control(
         "표시 단위",
         options=["백만원", "억원", "십억원"],
-        index=1,
-        horizontal=True,
+        default="억원",
     )
 
     st.divider()
     with st.expander("🔧 고급 설정"):
-        dart_unit = st.radio(
+        dart_unit = st.segmented_control(
             "DART 원본 단위",
             options=["천원", "백만원", "원"],
-            index=0,
+            default="천원",
             help="DART API 반환 금액의 원본 단위. 숫자가 이상하면 여기서 조정하세요.",
-            horizontal=True,
         )
 
 # ── 회사 검색 ──────────────────────────────────────────────────────────────
@@ -200,15 +196,16 @@ st.title("📊 요약재무제표")
 st.caption("사업보고서 기준 | 매출액 · 영업이익 · 영업이익률")
 st.caption("💡 사명이 바뀐 경우: 현재 사명, 종목코드(6자리), 또는 DART 기업코드(8자리)로 검색하세요.")
 
-c1, c2 = st.columns([4, 1])
-with c1:
-    query = st.text_input(
-        "검색",
-        placeholder="회사명 · 종목코드(6자리) · DART 기업코드(8자리)",
-        label_visibility="collapsed",
-    )
-with c2:
-    search_btn = st.button("🔍 검색", use_container_width=True)
+with st.form("search_form"):
+    c1, c2 = st.columns([4, 1])
+    with c1:
+        query = st.text_input(
+            "검색",
+            placeholder="회사명 · 종목코드(6자리) · DART 기업코드(8자리)",
+            label_visibility="collapsed",
+        )
+    with c2:
+        search_btn = st.form_submit_button("🔍 검색", use_container_width=True)
 
 if search_btn and query.strip():
     with st.spinner("기업 검색 중…"):
