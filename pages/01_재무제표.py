@@ -243,8 +243,10 @@ with st.sidebar:
     fs_div_label = st.segmented_control("재무제표 구분", options=["연결", "별도"], default="연결")
     want_cfs = (fs_div_label == "연결")
 
-    period = st.segmented_control("조회 기간", options=[5, 10, 20],
-                                  format_func=lambda x: f"{x}년", default=5)
+    period = st.segmented_control(
+        "조회 기간", options=[5, 10, 20, "최대"],
+        format_func=lambda x: (f"{x}년" if isinstance(x, int) else x), default=5,
+    )
 
     display_unit = st.segmented_control("표시 단위", options=["백만원", "억원", "십억원"], default="억원")
     st.caption("표시 단위는 조회 후에도 즉시 변경됩니다.")
@@ -288,23 +290,40 @@ if "search_results" in st.session_state:
     fetch_btn = st.button("📥 재무데이터 조회", type="primary", use_container_width=True)
 
     if fetch_btn:
-        years = list(range(LATEST_YEAR - period + 1, LATEST_YEAR + 1))
+        max_mode = (period == "최대")
+        if max_mode:
+            years_to_fetch = list(range(LATEST_YEAR, 1998, -1))   # 신→구, 조기종료
+        else:
+            years_to_fetch = list(range(LATEST_YEAR, LATEST_YEAR - period, -1))
+
         year_data: dict = {}
         all_diag: list  = []
+        consecutive_empty = 0
+        found_any = False
 
-        prog = st.progress(0, text="감사보고서 조회 중…")
-        for i, yr in enumerate(years):
-            d = fetch_year(API_KEY, chosen["corp_code"], yr, want_cfs)
-            year_data[yr] = d
-            all_diag.extend(d.get("diag", []))
-            prog.progress((i + 1) / len(years), text=f"{yr}년 조회 중…")
-        prog.empty()
+        with st.status("감사보고서 조회 중…", expanded=False) as status:
+            for yr in years_to_fetch:
+                status.update(label=f"{yr}년 조회 중…")
+                d = fetch_year(API_KEY, chosen["corp_code"], yr, want_cfs)
+                year_data[yr] = d
+                all_diag.extend(d.get("diag", []))
+
+                has = (d.get("revenue_won") is not None) or (d.get("opinc_won") is not None)
+                if has:
+                    found_any = True
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                # 최대 모드: 데이터가 한 번이라도 나온 뒤 3년 연속 비면 중단
+                if max_mode and found_any and consecutive_empty >= 3:
+                    break
+            status.update(label="조회 완료", state="complete")
 
         st.session_state["year_data"]   = year_data
-        st.session_state["years"]       = years
+        st.session_state["years"]       = sorted(year_data.keys())
         st.session_state["result_meta"] = {
             "corp_name": chosen["corp_name"], "corp_code": chosen["corp_code"],
-            "want_cfs": want_cfs,
+            "want_cfs": want_cfs, "max_mode": max_mode,
         }
         st.session_state["diag"] = all_diag
 
@@ -314,20 +333,37 @@ if "year_data" in st.session_state:
     years     = st.session_state["years"]
     meta      = st.session_state["result_meta"]
 
-    df = build_df(years, year_data, display_unit)
+    df_full = build_df(years, year_data, display_unit)
 
     req_label = "연결" if meta["want_cfs"] else "별도"
     st.subheader(f"{meta['corp_name']}  |  요청: {req_label}  |  단위: {display_unit}")
 
+    # 데이터 있는 연도만 추림
+    has_mask = df_full[["매출액", "영업이익"]].notna().any(axis=1)
+    if not has_mask.any():
+        st.error("선택한 기간 내 공시된 데이터가 없습니다.")
+        with st.expander("🔍 진단 정보"):
+            st.caption(f"기업코드: `{meta.get('corp_code','')}`")
+            st.code("\n".join(st.session_state.get("diag", [])) or "로그 없음", language="text")
+        st.stop()
+
+    start_year = int(df_full.loc[has_mask.idxmax(), "연도"])
+    df = df_full[df_full["연도"].astype(int) >= start_year].reset_index(drop=True)
+
+    # 공시 시작 안내 (요청 시작연도보다 늦게 시작된 경우)
+    requested_start = min(int(y) for y in years)
+    if start_year > requested_start:
+        st.info(f"ℹ️ 이 회사의 데이터는 **{start_year}년부터** 공시되어, 그 이전 기간은 제외했습니다.")
+
     # 연결 요청했으나 별도로 대체된 연도 안내
     if meta["want_cfs"]:
-        fb = [str(yr) for yr in years if year_data.get(yr, {}).get("kind") == "별도"]
+        fb = [str(yr) for yr in years if yr >= start_year and year_data.get(yr, {}).get("kind") == "별도"]
         if fb:
             st.info(f"ℹ️ {', '.join(fb)}년은 연결감사보고서가 없어 **별도** 기준으로 표시했습니다.")
 
     fmt = df.copy()
     for col in ["매출액", "영업이익"]:
-        fmt[col] = fmt[col].apply(lambda x: f"{x:,.1f}" if (x is not None and not pd.isna(x)) else "—")
+        fmt[col] = fmt[col].apply(lambda x: f"{x:,.0f}" if (x is not None and not pd.isna(x)) else "—")
     oi_rate = []
     for _, row in df.iterrows():
         if (row["매출액"] is not None and not pd.isna(row["매출액"])
@@ -362,7 +398,7 @@ if "year_data" in st.session_state:
 
     missing = df[df["매출액"].isna()]["연도"].tolist()
     if missing:
-        st.warning(f"⚠️ 다음 연도는 데이터를 가져오지 못했습니다: {', '.join(missing)}")
+        st.warning(f"⚠️ 공시 시작 이후이지만 데이터를 못 가져온 연도: {', '.join(missing)}")
 
     diag = st.session_state.get("diag", [])
     with st.expander("🔍 진단 정보"):
