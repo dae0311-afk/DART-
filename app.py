@@ -1,6 +1,7 @@
 """
 app.py  ─  메인 진입점 (인증 + 네비게이션)
 """
+import os
 import streamlit as st
 
 st.set_page_config(
@@ -33,7 +34,8 @@ def home_page():
             "</div></div>",
             unsafe_allow_html=True,
         )
-        st.page_link("pages/01_재무제표.py", label="요약재무제표 열기 →", use_container_width=True)
+        if os.path.exists(os.path.join(os.path.dirname(__file__), "pages/01_재무제표.py")):
+            st.page_link("pages/01_재무제표.py", label="요약재무제표 열기 →", use_container_width=True)
     with col2:
         st.markdown(
             "<div style='border:1px solid #eee;border-radius:10px;padding:16px;background:#fafafa;'>"
@@ -63,11 +65,17 @@ if not st.session_state.get("authenticated"):
     st.stop()
 
 # ── 네비게이션 (사이드바에 Home으로 표시) ───────────────────────────────────
-pages = [
-    st.Page(home_page, title="Home", icon="🏠", default=True),
-    st.Page("pages/01_재무제표.py", title="요약재무제표", icon="📊"),
-    st.Page("pages/00_연결진단.py", title="연결진단", icon="🩺"),
-    st.Page("pages/99_기업목록_생성.py", title="기업목록 생성", icon="🗂️"),
+_BASE = os.path.dirname(__file__)
+pages = [st.Page(home_page, title="Home", icon="🏠", default=True)]
+
+# 파일이 실제로 있을 때만 등록 (없으면 자동 건너뜀)
+_optional = [
+    ("pages/01_재무제표.py", "요약재무제표", "📊"),
+    ("pages/00_연결진단.py", "연결진단", "🩺"),
+    ("pages/99_기업목록_생성.py", "기업목록 생성", "🗂️"),
 ]
+for rel, title, icon in _optional:
+    if os.path.exists(os.path.join(_BASE, rel)):
+        pages.append(st.Page(rel, title=title, icon=icon))
 nav = st.navigation(pages)
 nav.run()
