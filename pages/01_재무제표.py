@@ -31,7 +31,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v15"
+PARSER_VER = "v16"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -545,9 +545,10 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
         "부채총계":   find_acct(m_liab, "BS"),
         "자본총계":   find_acct(m_equity, "BS"),
     }
-    # 현금/차입금 구성 (BS)
+    # 현금/차입금 구성 (BS). 같은 항목 다중 출현 시 진단 기록.
     cash_bd, debt_bd = {}, {}
     for name, mf in CASH_SPECS:
+        hits = []
         for it in items:
             if it.get("sj_div") != "BS":
                 continue
@@ -555,8 +556,12 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
             if mf(nm):
                 v = parse_amt(it.get("thstrm_amount"))
                 if v is not None:
-                    cash_bd[name] = cash_bd.get(name, 0) + v
-                break
+                    hits.append((nm, v))
+        if hits:
+            cash_bd[name] = hits[0][1]   # BS 첫 매칭만 채택
+            if len(hits) > 1:
+                detail = " / ".join(f"{n}:{a/1e8:.0f}억" for n, a in hits[:6])
+                diag.append(f"  [XBRL:{name}] 다중 {len(hits)}건 → {detail} (채택:{hits[0][1]/1e8:.0f}억)")
     for name, mf in DEBT_SPECS:
         for it in items:
             if it.get("sj_div") != "BS":
