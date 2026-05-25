@@ -20,7 +20,6 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title="요약재무제표", page_icon="📊", layout="wide")
 
 if not st.session_state.get("authenticated"):
     st.warning("🔐 메인 페이지에서 먼저 로그인하세요.")
@@ -32,7 +31,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v13"
+PARSER_VER = "v14"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -406,11 +405,35 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
         rou, h3 = sum_values(rows, m_rou,   section)
         return (dep + amo + rou, (h1 or h2 or h3))
 
-    da_won, da_hit = da_from("CF")          # 1순위: 현금흐름표
-    da_src = "현금흐름표"
-    if not da_hit:                          # 2순위: 섹션 미상(주석 등 전체)
-        da_won, da_hit = da_from(None)
-        da_src = "주석/전체"
+    da_won, da_hit = da_from("CF")          # 1순위: 표 파싱 (CF 섹션)
+    da_src = "현금흐름표(표)"
+
+    # 2순위: 현금흐름표 평문 구간에서 직접 추출 (섹션 태깅 실패 대비)
+    if not da_hit:
+        plain_all = re.sub(r"<[^>]+>", " ", full_text)
+        cf_pos = plain_all.find("현금흐름표")
+        cf_text = plain_all[cf_pos: cf_pos + 8000] if cf_pos >= 0 else ""
+        if cf_text:
+            da_sum = 0.0
+            found = set()
+            # 긴 키워드 우선 (사용권자산감가상각비가 감가상각비에 중복 매칭되지 않도록)
+            for kw in ["사용권자산감가상각비", "사용권자산상각비", "무형자산상각비",
+                       "유형자산감가상각비", "감가상각비"]:
+                for m in re.finditer(re.escape(kw), cf_text):
+                    span = (m.start(), m.end())
+                    # 이미 더 긴 키워드로 잡은 위치는 건너뜀
+                    if any(s <= m.start() < e for s, e in found):
+                        continue
+                    tail = cf_text[m.end(): m.end() + 30]
+                    nm = re.search(r"\d{1,3}(?:,\d{3})+|\d{4,}", tail)
+                    if nm:
+                        v = parse_amount(nm.group())
+                        if v and abs(v) > 0:
+                            da_sum += abs(v); found.add(span); break
+            if da_sum > 0:
+                da_won, da_hit = da_sum, True
+                da_src = "현금흐름표(평문)"
+
     da_won = da_won * mult if da_hit else None
 
     out["DA"]     = da_won
@@ -528,13 +551,15 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
     out["현금성자산"] = sum(cash_bd.values()) if cash_bd else None
     out["총차입금"]   = sum(debt_bd.values()) if debt_bd else None
 
-    # D&A: XBRL 전 섹션에서 탐색 (DART AcntAll은 CF를 sj_div 없이 주거나 누락하기도 함)
-    da, da_hit = 0.0, False
+    # ── D&A 추출 (EBITDA용) ──
+    # XBRL과 원문 D&A는 모두 '원 단위'로 정규화되어 있다는 전제.
+    # 매출/영업이익(XBRL, 원)과 동일 단위이므로 그대로 더하면 됨.
+    da, da_hit, da_src = 0.0, False, "미발견"
+
+    # 1) XBRL 전 섹션에서 D&A 탐색 (BS 제외)
     seen_da = set()
     for it in items:
-        sj = it.get("sj_div") or ""
-        # IS/BS의 자산 계정과 혼동 방지: 현금흐름표 또는 sj_div 미상만
-        if sj in ("BS",):
+        if (it.get("sj_div") or "") == "BS":
             continue
         nm = (it.get("account_nm") or "").replace(" ", "")
         if m_dep(nm) or m_amort(nm) or m_rou(nm):
@@ -545,38 +570,32 @@ def fetch_structured(api_key, corp_code, year, want_cfs, diag) -> Optional[dict]
             v = parse_amt(it.get("thstrm_amount"))
             if v is not None and abs(v) > 0:
                 da += abs(v); da_hit = True
-    da_src = "XBRL"
+    if da_hit:
+        da_src = "XBRL"
 
-    # XBRL에 D&A 없으면 → 사업보고서 원문(현금흐름표)에서 보강 (상장사 핵심 경로)
+    # 2) XBRL에 없으면 사업보고서 원문(현금흐름표) 파싱
     if not da_hit:
-        rcept = find_report_rcept(api_key, corp_code, year, diag)   # 사업보고서(A)
+        rcept = find_report_rcept(api_key, corp_code, year, diag)
         if not rcept:
-            rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)  # 보조
+            rcept, _ = find_audit_rcept(api_key, corp_code, year, want_cfs, diag)
         if rcept:
             doc = parse_financials(api_key, rcept, diag)
             doc_da = doc.get("DA")
-            doc_oi = doc.get("영업이익")
-            xbrl_oi = out.get("영업이익")
-            if doc_da is not None:
-                # 단위 일관성 보정: 문서 영업이익과 XBRL 영업이익 비율로 D&A 스케일 맞춤
-                if doc_oi and xbrl_oi and doc_oi != 0:
-                    scale = xbrl_oi / doc_oi
-                    # 스케일이 1000배/0.001배 근처면 단위 차이 → 보정
-                    if 0.0005 < abs(scale) < 2000:
-                        doc_da = doc_da * scale
-                        diag.append(f"{year} · D&A 단위보정 scale={scale:.4g}")
+            if doc_da is not None and doc_da > 0:
                 da = doc_da; da_hit = True; da_src = "원문(CF)"
 
-    # 최종 방어: D&A가 영업이익의 5배 초과면 단위오류로 간주, EBITDA 공란
-    if da_hit and out.get("영업이익") and abs(da) > abs(out["영업이익"]) * 5:
-        diag.append(f"{year} · D&A 비현실값({da:.3g}) → EBITDA 공란")
+    # 3) sanity 체크: D&A는 보통 매출의 50% 이하. 초과 시 단위오류로 보고 폐기.
+    xbrl_oi  = out.get("영업이익")
+    xbrl_rev = out.get("매출액")
+    if da_hit and xbrl_rev and abs(da) > abs(xbrl_rev) * 0.6:
+        diag.append(f"{year} · D&A({da:.3g})가 매출 60% 초과 → 단위오류 의심, EBITDA 공란")
         da_hit = False
 
     out["DA"] = da if da_hit else None
     out["DA_src"] = da_src if da_hit else "미발견"
 
-    if out["영업이익"] is not None and da_hit:
-        out["EBITDA"] = out["영업이익"] + da
+    if xbrl_oi is not None and da_hit:
+        out["EBITDA"] = xbrl_oi + da
     else:
         out["EBITDA"] = None
 
@@ -663,6 +682,19 @@ def fmt_pct(x):
     return f"({abs(x):.1f}%)" if x < 0 else f"{x:.1f}%"
 
 
+# ── 사이드바 토글(화살표) 옆에 '조회 옵션' 라벨 표시 (#4) ──
+st.markdown("""
+<style>
+[data-testid="stSidebarCollapsedControl"]::after {
+    content: "조회 옵션";
+    font-size: 0.85rem;
+    color: #555;
+    margin-left: 6px;
+    white-space: nowrap;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── 사이드바 ────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("⚙️ 조회 옵션")
@@ -674,8 +706,8 @@ with st.sidebar:
     st.caption("옵션을 바꾸면 결과가 즉시 갱신됩니다.")
 
 # ── 검색 ────────────────────────────────────────────────────────────────────
-st.title("📊 요약재무제표")
-st.caption("감사보고서 기준 · PE 요약 포맷 (원 단위 추출)")
+st.markdown("<h3 style='margin-bottom:2px;'>📊 요약재무제표</h3>", unsafe_allow_html=True)
+st.caption("감사보고서·사업보고서 기준 · PE 요약 포맷")
 st.caption("💡 사명 변경 시: 현재 사명, 종목코드(6자리), DART 기업코드(8자리)로 검색하세요.")
 
 with st.form("search_form"):
@@ -805,22 +837,30 @@ if "year_data" in st.session_state:
         num, rev = raw(y, key), raw(y, "매출액")
         return num / rev * 100 if (num is not None and rev) else None
 
-    # ── 요약표 (HTML) ──
+    # ── 요약표 (HTML, 가로스크롤 + 첫 열 고정) ──
     ys = disp_years
-    header = "".join(f'<th style="background:#3A4A5E;color:#fff;text-align:right;padding:6px 12px;">{y}</th>' for y in ys)
+    STICKY = "position:sticky;left:0;z-index:2;background:#fff;min-width:120px;border-right:1px solid #eee;"
+    YRCOL  = "min-width:90px;"
+    header = "".join(
+        f'<th style="background:#3A4A5E;color:#fff;text-align:right;padding:6px 12px;{YRCOL}">{y}</th>'
+        for y in ys)
+
     def row_main(label, key):
-        tds = "".join(f'<td style="text-align:right;padding:5px 12px;">{fmt_val(val(y,key))}</td>' for y in ys)
-        return f'<tr><td style="padding:5px 10px;font-weight:600;">{label}</td>{tds}</tr>'
+        tds = "".join(f'<td style="text-align:right;padding:5px 12px;{YRCOL}">{fmt_val(val(y,key))}</td>' for y in ys)
+        return f'<tr><td style="padding:5px 10px;font-weight:600;{STICKY}">{label}</td>{tds}</tr>'
+
     def row_sub(label, key):
-        tds = "".join(f'<td style="text-align:right;padding:4px 12px;font-style:italic;color:#555;">{fmt_val(val(y,key))}</td>' for y in ys)
-        return f'<tr><td style="padding:4px 10px 4px 22px;font-style:italic;color:#555;">{label}</td>{tds}</tr>'
+        tds = "".join(f'<td style="text-align:right;padding:4px 12px;font-style:italic;color:#555;{YRCOL}">{fmt_val(val(y,key))}</td>' for y in ys)
+        return f'<tr><td style="padding:4px 10px 4px 22px;font-style:italic;color:#555;{STICKY}">{label}</td>{tds}</tr>'
+
     def row_pct(label, fn):
-        tds = "".join(f'<td style="text-align:right;padding:4px 12px;font-style:italic;color:#777;">{fmt_pct(fn(y))}</td>' for y in ys)
-        return f'<tr><td style="padding:4px 10px 4px 22px;font-style:italic;color:#777;">{label}</td>{tds}</tr>'
+        tds = "".join(f'<td style="text-align:right;padding:4px 12px;font-style:italic;color:#777;{YRCOL}">{fmt_pct(fn(y))}</td>' for y in ys)
+        return f'<tr><td style="padding:4px 10px 4px 22px;font-style:italic;color:#777;{STICKY}">{label}</td>{tds}</tr>'
 
     html = f"""
-    <table style="border-collapse:collapse;width:100%;font-size:0.9rem;">
-      <tr><th style="background:#3A4A5E;color:#fff;text-align:left;padding:6px 10px;">(단위 : {display_unit})</th>{header}</tr>
+    <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+    <table style="border-collapse:collapse;font-size:0.9rem;white-space:nowrap;">
+      <tr><th style="background:#3A4A5E;color:#fff;text-align:left;padding:6px 10px;position:sticky;left:0;z-index:3;min-width:120px;">(단위 : {display_unit})</th>{header}</tr>
       {row_main("매출액","매출액")}
       {row_pct("Growth", growth)}
       {row_main("EBITDA","EBITDA")}
@@ -835,6 +875,7 @@ if "year_data" in st.session_state:
       {row_sub("총차입금","총차입금")}
       {row_main("자본총계","자본총계")}
     </table>
+    </div>
     """
     st.markdown(html, unsafe_allow_html=True)
 
@@ -935,35 +976,38 @@ if "year_data" in st.session_state:
     st.plotly_chart(fig5, use_container_width=True,
                     config={"staticPlot": True, "displayModeBar": False})
 
-    # ── 구성 테이블 (요약표와 동일한 우측정렬 HTML) ──
+    # ── 구성 테이블 (가로스크롤 + 첫 열 고정) ──
     def breakdown_html(bd_key, total_key):
         comps = []
         for y in ys:
             comps += list(year_data[y].get(bd_key, {}).keys())
         comps = list(dict.fromkeys(comps))
 
-        header = "".join(f'<th style="background:#3A4A5E;color:#fff;text-align:right;padding:6px 12px;">{y}</th>' for y in ys)
+        STK = "position:sticky;left:0;z-index:2;background:#fff;min-width:120px;border-right:1px solid #eee;"
+        YR  = "min-width:90px;"
+        header = "".join(f'<th style="background:#3A4A5E;color:#fff;text-align:right;padding:6px 12px;{YR}">{y}</th>' for y in ys)
         body = ""
         for comp in comps:
             tds = ""
             for y in ys:
                 v = year_data[y].get(bd_key, {}).get(comp, None)
                 cell = fmt_val(v / div) if v is not None else "—"
-                tds += f'<td style="text-align:right;padding:5px 12px;">{cell}</td>'
-            body += f'<tr><td style="padding:5px 10px 5px 22px;color:#333;">{comp}</td>{tds}</tr>'
-        # 합계
+                tds += f'<td style="text-align:right;padding:5px 12px;{YR}">{cell}</td>'
+            body += f'<tr><td style="padding:5px 10px 5px 22px;color:#333;{STK}">{comp}</td>{tds}</tr>'
         stds = ""
         for y in ys:
             v = raw(y, total_key)
             cell = fmt_val(v / div) if v is not None else "—"
-            stds += f'<td style="text-align:right;padding:6px 12px;font-weight:600;">{cell}</td>'
-        body += f'<tr><td style="padding:6px 10px;font-weight:600;">합계</td>{stds}</tr>'
+            stds += f'<td style="text-align:right;padding:6px 12px;font-weight:600;{YR}">{cell}</td>'
+        body += f'<tr><td style="padding:6px 10px;font-weight:600;{STK}">합계</td>{stds}</tr>'
 
         return f"""
-        <table style="border-collapse:collapse;width:100%;font-size:0.9rem;">
-          <tr><th style="background:#3A4A5E;color:#fff;text-align:left;padding:6px 10px;">(단위 : {display_unit})</th>{header}</tr>
+        <div style="overflow-x:auto;-webkit-overflow-scrolling:touch;">
+        <table style="border-collapse:collapse;font-size:0.9rem;white-space:nowrap;">
+          <tr><th style="background:#3A4A5E;color:#fff;text-align:left;padding:6px 10px;position:sticky;left:0;z-index:3;min-width:120px;">(단위 : {display_unit})</th>{header}</tr>
           {body}
         </table>
+        </div>
         """
 
     st.divider()
