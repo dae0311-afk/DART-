@@ -8,7 +8,6 @@ import time
 import requests
 import streamlit as st
 
-st.set_page_config(page_title="연결 진단", page_icon="🩺")
 
 if not st.session_state.get("authenticated"):
     st.warning("🔐 메인 페이지에서 먼저 로그인하세요.")
