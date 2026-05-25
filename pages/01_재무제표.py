@@ -68,6 +68,8 @@ CASH_SPECS = [
     ("현금및현금성자산", lambda L: L in ("현금및현금성자산", "현금및현금등가물")
                                 or L.startswith("현금및현금성자산") or L.startswith("현금및현금등가물")),
     ("단기금융상품",     lambda L: L == "단기금융상품"),
+    ("기타유동금융자산", lambda L: L == "기타유동금융자산"),   # 정기예금 등 (주석 확인 권장)
+    ("단기투자자산",     lambda L: L == "단기투자자산"),
     ("장기금융상품",     lambda L: L == "장기금융상품"),
 ]
 # 총차입금 구성 (정확매칭 위주 — 합계/주석 행 오인 방지)
@@ -75,10 +77,8 @@ DEBT_SPECS = [
     ("단기차입금",       lambda L: L == "단기차입금"),
     ("유동성장기부채",   lambda L: L in ("유동성장기부채", "유동성장기차입금")),
     ("유동성사채",       lambda L: L == "유동성사채"),
-    ("유동리스부채",     lambda L: L in ("유동리스부채", "유동성리스부채")),
     ("사채",             lambda L: L in ("사채", "전환사채", "신주인수권부사채")),
     ("장기차입금",       lambda L: L == "장기차입금"),
-    ("비유동리스부채",   lambda L: L in ("비유동리스부채", "장기리스부채")),
 ]
 
 
@@ -374,17 +374,16 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
         v = find_value(rows, matcher)
         return v * mult if v is not None else None
 
-    def g_bs(matcher, label_for_diag=None):
-        """재무상태표(BS) 섹션 우선. 없으면 전체 첫 매칭. 진단 로그 기록."""
+    def g_bs(matcher, label_for_diag=None, bs_only=False):
+        """재무상태표(BS) 섹션 우선. bs_only=True면 CF/주석 노이즈 차단 위해 BS에서만."""
         # 1순위: BS 섹션
         v = find_value(rows, matcher, section="BS")
         src = "BS"
-        if v is None:
-            # 2순위: 섹션 미상(태깅 실패) — 단, 주석/명세 중복 위험 있음
+        if v is None and not bs_only:
+            # 2순위: 섹션 미상(태깅 실패) — 총계류에만 허용
             v = find_value(rows, matcher, section=None)
             src = "전체"
         if label_for_diag and v is not None:
-            # 같은 라벨이 문서에서 몇 번/얼마로 나오는지 진단
             hits = []
             for lb, cells, sec in rows:
                 if matcher(lb):
@@ -403,14 +402,14 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
         "부채총계":   g_bs(m_liab),
         "자본총계":   g_bs(m_equity),
     }
-    # 현금성자산 / 총차입금 구성 (재무상태표 본문 우선)
+    # 현금성자산 / 총차입금 구성 — 반드시 BS 본문만 (현금흐름표 라인 차단)
     cash_bd, debt_bd = {}, {}
     for name, mf in CASH_SPECS:
-        v = g_bs(mf, name)
+        v = g_bs(mf, name, bs_only=True)
         if v is not None:
             cash_bd[name] = v
     for name, mf in DEBT_SPECS:
-        v = g_bs(mf, name)
+        v = g_bs(mf, name, bs_only=True)
         if v is not None:
             debt_bd[name] = v
     # 채택 내역 진단 (어떤 항목이 합산됐는지 확정)
