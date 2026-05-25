@@ -23,19 +23,43 @@ def home_page():
     )
     st.divider()
 
+    # page_link를 박스 모양으로 스타일링 → 박스 전체가 클릭영역
+    st.markdown("""
+    <style>
+    div[data-testid="stPageLink"] a {
+        display: block;
+        border: 1px solid #d0d7e2;
+        border-radius: 10px;
+        padding: 16px 18px;
+        background: #f7f9fc;
+        text-decoration: none !important;
+        transition: all 0.15s ease;
+    }
+    div[data-testid="stPageLink"] a:hover {
+        border-color: #2E6DA4;
+        background: #eef3fa;
+        box-shadow: 0 2px 8px rgba(46,109,164,0.12);
+    }
+    div[data-testid="stPageLink"] a p {
+        font-size: 0.95rem !important;
+        color: #1E3D6B !important;
+        margin: 0 !important;
+        white-space: normal !important;
+        line-height: 1.5 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown(
-            "<div style='border:1px solid #e0e0e0;border-radius:10px;padding:16px;'>"
-            "<div style='font-size:1.05rem;font-weight:700;margin-bottom:6px;'>📊 요약재무제표</div>"
-            "<div style='color:#555;font-size:0.9rem;line-height:1.5;'>"
-            "감사보고서·사업보고서 기반 PE 요약 포맷.<br>"
-            "매출·EBITDA·영업이익·순이익, 자산·부채·자본, 현금성자산·총차입금 구성과 추이 차트."
-            "</div></div>",
-            unsafe_allow_html=True,
-        )
         if os.path.exists(os.path.join(os.path.dirname(__file__), "pages/01_재무제표.py")):
-            st.page_link("pages/01_재무제표.py", label="요약재무제표 열기 →", use_container_width=True)
+            st.page_link(
+                "pages/01_재무제표.py",
+                label="📊 요약재무제표\n\n감사보고서·사업보고서 기반 PE 요약 포맷. 매출·EBITDA·영업이익·순이익, 자산·부채·자본, 현금성자산·총차입금 구성과 추이 차트.",
+                use_container_width=True,
+            )
+        else:
+            st.info("요약재무제표 페이지를 준비 중입니다.")
     with col2:
         st.markdown(
             "<div style='border:1px solid #eee;border-radius:10px;padding:16px;background:#fafafa;'>"
