@@ -31,7 +31,7 @@ LATEST_YEAR = datetime.date.today().year - 1
 
 UNIT_WON = {"원": 1, "천원": 1_000, "백만원": 1_000_000, "억원": 100_000_000, "십억원": 1_000_000_000}
 ROMAN    = "ⅠⅡⅢⅣⅤⅥⅦⅧⅨⅩⅪⅫ"
-PARSER_VER = "v14"
+PARSER_VER = "v15"
 
 
 # ── 공통 HTTP (연결/읽기 타임아웃 분리 + 재시도) ─────────────────────────────
@@ -375,22 +375,43 @@ def parse_financials(api_key, rcept_no, diag) -> dict:
         v = find_value(rows, matcher)
         return v * mult if v is not None else None
 
+    def g_bs(matcher, label_for_diag=None):
+        """재무상태표(BS) 섹션 우선. 없으면 전체 첫 매칭. 진단 로그 기록."""
+        # 1순위: BS 섹션
+        v = find_value(rows, matcher, section="BS")
+        src = "BS"
+        if v is None:
+            # 2순위: 섹션 미상(태깅 실패) — 단, 주석/명세 중복 위험 있음
+            v = find_value(rows, matcher, section=None)
+            src = "전체"
+        if label_for_diag and v is not None:
+            # 같은 라벨이 문서에서 몇 번/얼마로 나오는지 진단
+            hits = []
+            for lb, cells, sec in rows:
+                if matcher(lb):
+                    amt = pick_amount(cells)
+                    if amt is not None:
+                        hits.append(f"{sec or '?'}:{amt*mult/1e8:.0f}억")
+            if len(hits) > 1:
+                diag.append(f"  [{label_for_diag}] 다중매칭 {len(hits)}건 → {' / '.join(hits[:6])} (채택:{src})")
+        return v * mult if v is not None else None
+
     out = {
         "매출액":     g(m_rev),
         "영업이익":   g(m_oi),
         "당기순이익": g(m_ni),
-        "자산총계":   g(m_asset),
-        "부채총계":   g(m_liab),
-        "자본총계":   g(m_equity),
+        "자산총계":   g_bs(m_asset),
+        "부채총계":   g_bs(m_liab),
+        "자본총계":   g_bs(m_equity),
     }
-    # 현금성자산 / 총차입금 구성
+    # 현금성자산 / 총차입금 구성 (재무상태표 본문 우선)
     cash_bd, debt_bd = {}, {}
     for name, mf in CASH_SPECS:
-        v = g(mf)
+        v = g_bs(mf, name)
         if v is not None:
             cash_bd[name] = v
     for name, mf in DEBT_SPECS:
-        v = g(mf)
+        v = g_bs(mf, name)
         if v is not None:
             debt_bd[name] = v
     out["cash_bd"] = cash_bd
